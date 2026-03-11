@@ -1,4 +1,5 @@
 """PostgreSQL database initialization and helpers (Supabase)."""
+import socket
 import psycopg2
 import psycopg2.extras
 from urllib.parse import urlparse
@@ -53,9 +54,16 @@ def get_conn() -> _Conn:
             "or Streamlit Cloud app Settings → Secrets."
         )
     r = urlparse(DATABASE_URL)
+    port = r.port or 5432
+    # Resolve to IPv4 — Streamlit Cloud lacks outbound IPv6 connectivity
+    try:
+        infos = socket.getaddrinfo(r.hostname, port, socket.AF_INET)
+        host = infos[0][4][0]
+    except Exception:
+        host = r.hostname
     conn = psycopg2.connect(
-        host=r.hostname,
-        port=r.port or 5432,
+        host=host,
+        port=port,
         dbname=r.path.lstrip("/"),
         user=r.username,
         password=r.password,
