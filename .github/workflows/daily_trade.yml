@@ -1,0 +1,30 @@
+name: Daily Auto Trade
+
+on:
+  schedule:
+    - cron: '0 4 * * 1-5'   # 4:00 AM UTC = 9:30 AM IST, weekdays only
+  workflow_dispatch:           # allow manual trigger from GitHub UI → Actions tab
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run auto-trading pipeline
+        run: python run_auto_trader.py
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}

@@ -48,7 +48,7 @@ def extract_themes(force_refresh: bool = False, provider: str = "claude") -> lis
 
     # Return cached themes for today (cache is provider-agnostic — same news, same themes)
     rows = c.execute(
-        "SELECT * FROM themes WHERE session_date = ? ORDER BY confidence DESC", (today,)
+        "SELECT * FROM themes WHERE session_date = %s ORDER BY confidence DESC", (today,)
     ).fetchall()
     if rows:
         conn.close()
@@ -91,15 +91,16 @@ def extract_themes(force_refresh: bool = False, provider: str = "claude") -> lis
     data = json.loads(raw)
     themes = data.get("themes", [])
 
-    c.execute("DELETE FROM themes WHERE session_date = ?", (today,))
+    c.execute("DELETE FROM themes WHERE session_date = %s", (today,))
     theme_records = []
     for t in themes:
         c.execute("""
             INSERT INTO themes (session_date, theme, confidence, evidence, sectors)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, (today, t["theme"], t["confidence"],
               json.dumps(t["evidence"]), json.dumps(t["sectors"])))
-        t["id"] = c.lastrowid
+        t["id"] = c.fetchone()["id"]
         theme_records.append(t)
 
     conn.commit()

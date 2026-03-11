@@ -1,14 +1,53 @@
-"""SQLite database initialization and helpers."""
-import sqlite3
-import os
-from config import DB_PATH
+"""PostgreSQL database initialization and helpers (Supabase)."""
+import psycopg2
+import psycopg2.extras
+from config import DATABASE_URL
 
 
-def get_conn():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+class _Cursor:
+    """Thin cursor wrapper so execute() returns self, matching sqlite3 behaviour."""
+    def __init__(self, cur):
+        self._cur = cur
+
+    def execute(self, sql, params=None):
+        self._cur.execute(sql, params)
+        return self
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    @property
+    def rowcount(self):
+        return self._cur.rowcount
+
+
+class _Conn:
+    """Thin connection wrapper that returns RealDictCursor by default."""
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return _Cursor(self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor))
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self._conn.close()
+
+
+def get_conn() -> _Conn:
+    conn = psycopg2.connect(DATABASE_URL)
+    return _Conn(conn)
 
 
 def init_db():
@@ -18,33 +57,33 @@ def init_db():
     # News headlines cache
     c.execute("""
         CREATE TABLE IF NOT EXISTS news (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             source TEXT,
             title TEXT UNIQUE,
             summary TEXT,
             link TEXT,
             published_at TEXT,
-            fetched_at TEXT DEFAULT (datetime('now'))
+            fetched_at TEXT DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
         )
     """)
 
     # LLM-extracted themes (one session = one batch)
     c.execute("""
         CREATE TABLE IF NOT EXISTS themes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             session_date TEXT,
             theme TEXT,
             confidence REAL,
             evidence TEXT,
             sectors TEXT,
-            created_at TEXT DEFAULT (datetime('now'))
+            created_at TEXT DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS')
         )
     """)
 
     # Screened stocks per theme
     c.execute("""
         CREATE TABLE IF NOT EXISTS screened_stocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             session_date TEXT,
             theme_id INTEGER,
             ticker TEXT,
@@ -58,7 +97,7 @@ def init_db():
             revenue_growth REAL,
             eps_growth REAL,
             current_price REAL,
-            screened_at TEXT DEFAULT (datetime('now')),
+            screened_at TEXT DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
             FOREIGN KEY (theme_id) REFERENCES themes(id)
         )
     """)
@@ -66,13 +105,13 @@ def init_db():
     # Paper trading: strategy versions
     c.execute("""
         CREATE TABLE IF NOT EXISTS strategies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             theme TEXT,
             virtual_capital REAL NOT NULL,
             notes TEXT,
             status TEXT DEFAULT 'active',
-            created_at TEXT DEFAULT (datetime('now')),
+            created_at TEXT DEFAULT TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'),
             closed_at TEXT
         )
     """)
@@ -80,7 +119,7 @@ def init_db():
     # Paper trading: individual trades per strategy
     c.execute("""
         CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             strategy_id INTEGER NOT NULL,
             ticker TEXT NOT NULL,
             company_name TEXT,
@@ -96,7 +135,7 @@ def init_db():
     # Paper trading: daily P&L snapshots
     c.execute("""
         CREATE TABLE IF NOT EXISTS daily_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             strategy_id INTEGER NOT NULL,
             snapshot_date TEXT NOT NULL,
             portfolio_value REAL NOT NULL,
@@ -107,7 +146,7 @@ def init_db():
         )
     """)
 
-    # Unique index ensures INSERT OR IGNORE correctly deduplicates screened stocks
+    # Unique index ensures ON CONFLICT correctly deduplicates screened stocks
     c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_screened_unique
         ON screened_stocks(session_date, theme_id, ticker)
@@ -118,19 +157,19 @@ def init_db():
     # Single active auto portfolio (capital + cash tracking)
     c.execute("""
         CREATE TABLE IF NOT EXISTS auto_portfolio (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             capital REAL NOT NULL DEFAULT 500000,
             cash_remaining REAL NOT NULL,
             status TEXT DEFAULT 'active',
-            created_at TEXT DEFAULT (date('now'))
+            created_at TEXT DEFAULT TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')
         )
     """)
 
     # Open/closed positions held by the auto portfolio
     c.execute("""
         CREATE TABLE IF NOT EXISTS auto_positions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             portfolio_id INTEGER NOT NULL,
             ticker TEXT NOT NULL,
             company_name TEXT,
@@ -148,7 +187,7 @@ def init_db():
     # Every buy/sell/stop_loss action ever taken
     c.execute("""
         CREATE TABLE IF NOT EXISTS auto_trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             portfolio_id INTEGER NOT NULL,
             run_id INTEGER,
             ticker TEXT,
@@ -164,7 +203,7 @@ def init_db():
     # One row per pipeline run — used for equity curve
     c.execute("""
         CREATE TABLE IF NOT EXISTS auto_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             portfolio_id INTEGER NOT NULL,
             run_date TEXT,
             themes_found INTEGER DEFAULT 0,

@@ -1,6 +1,5 @@
-"""Fetch Indian financial news from free RSS feeds and store in SQLite."""
+"""Fetch Indian financial news from free RSS feeds and store in PostgreSQL."""
 import re
-import sqlite3
 import feedparser
 import requests
 from datetime import datetime, timedelta
@@ -41,12 +40,13 @@ def fetch_all_feeds(hours_back: int = 48) -> int:
 
             try:
                 c.execute("""
-                    INSERT OR IGNORE INTO news (source, title, summary, link, published_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO news (source, title, summary, link, published_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (title) DO NOTHING
                 """, (feed_cfg["name"], title, summary, link, pub))
                 if c.rowcount > 0:
                     new_count += 1
-            except sqlite3.Error:
+            except Exception:
                 pass
 
     conn.commit()
@@ -58,15 +58,14 @@ def get_recent_headlines(hours_back: int = 48, limit: int = 200) -> list[dict]:
     """Return recent headlines from DB for LLM processing."""
     conn = get_conn()
     c = conn.cursor()
-    # Use SQLite-compatible format (space separator, not 'T') so string comparison works
     cutoff = (datetime.utcnow() - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
 
     rows = c.execute("""
         SELECT source, title, summary
         FROM news
-        WHERE fetched_at >= ?
+        WHERE fetched_at >= %s
         ORDER BY fetched_at DESC
-        LIMIT ?
+        LIMIT %s
     """, (cutoff, limit)).fetchall()
 
     conn.close()

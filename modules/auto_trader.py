@@ -46,10 +46,10 @@ class AutoTrader:
             conn.close()
             return self.portfolio_id
         c.execute(
-            "INSERT INTO auto_portfolio (name, capital, cash_remaining, status) VALUES (?, ?, ?, 'active')",
+            "INSERT INTO auto_portfolio (name, capital, cash_remaining, status) VALUES (%s, %s, %s, 'active') RETURNING id",
             ("Auto Trader v1", capital, capital),
         )
-        self.portfolio_id = c.lastrowid
+        self.portfolio_id = c.fetchone()["id"]
         conn.commit()
         conn.close()
         return self.portfolio_id
@@ -61,10 +61,10 @@ class AutoTrader:
         conn = get_conn()
         c = conn.cursor()
         port = dict(c.execute(
-            "SELECT * FROM auto_portfolio WHERE id = ?", (self.portfolio_id,)
+            "SELECT * FROM auto_portfolio WHERE id = %s", (self.portfolio_id,)
         ).fetchone())
         positions_raw = c.execute(
-            "SELECT * FROM auto_positions WHERE portfolio_id = ? AND status = 'open'",
+            "SELECT * FROM auto_positions WHERE portfolio_id = %s AND status = 'open'",
             (self.portfolio_id,),
         ).fetchall()
         conn.close()
@@ -121,7 +121,7 @@ class AutoTrader:
         conn = get_conn()
         c = conn.cursor()
         rows = c.execute(
-            "SELECT * FROM auto_trades WHERE portfolio_id = ? ORDER BY trade_date DESC, id DESC",
+            "SELECT * FROM auto_trades WHERE portfolio_id = %s ORDER BY trade_date DESC, id DESC",
             (self.portfolio_id,),
         ).fetchall()
         conn.close()
@@ -134,7 +134,7 @@ class AutoTrader:
         rows = c.execute(
             """SELECT run_date, portfolio_value, llm_summary
                FROM auto_runs
-               WHERE portfolio_id = ? AND portfolio_value IS NOT NULL
+               WHERE portfolio_id = %s AND portfolio_value IS NOT NULL
                ORDER BY run_date, id""",
             (self.portfolio_id,),
         ).fetchall()
@@ -146,7 +146,7 @@ class AutoTrader:
         conn = get_conn()
         c = conn.cursor()
         row = c.execute(
-            "SELECT * FROM auto_runs WHERE portfolio_id = ? ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM auto_runs WHERE portfolio_id = %s ORDER BY id DESC LIMIT 1",
             (self.portfolio_id,),
         ).fetchone()
         conn.close()
@@ -174,10 +174,10 @@ class AutoTrader:
         conn = get_conn()
         c = conn.cursor()
         c.execute(
-            "INSERT INTO auto_runs (portfolio_id, run_date) VALUES (?, ?)",
+            "INSERT INTO auto_runs (portfolio_id, run_date) VALUES (%s, %s) RETURNING id",
             (pid, today),
         )
-        run_id = c.lastrowid
+        run_id = c.fetchone()["id"]
         conn.commit()
         conn.close()
 
@@ -320,19 +320,20 @@ class AutoTrader:
             c = conn.cursor()
             c.execute("""
                 UPDATE auto_runs SET
-                    themes_found = ?,
-                    stocks_screened = ?,
-                    buys_made = ?,
-                    sells_made = ?,
-                    stop_losses_triggered = ?,
-                    portfolio_value = ?,
-                    llm_summary = ?,
-                    completed_at = datetime('now')
-                WHERE id = ?
+                    themes_found = %s,
+                    stocks_screened = %s,
+                    buys_made = %s,
+                    sells_made = %s,
+                    stop_losses_triggered = %s,
+                    portfolio_value = %s,
+                    llm_summary = %s,
+                    completed_at = %s
+                WHERE id = %s
             """, (
                 len(themes), len(unique_candidates),
                 len(log["buys"]), len(log["sells"]), len(log["stop_losses"]),
-                final_state["total_value"], log["summary"], run_id,
+                final_state["total_value"], log["summary"],
+                __import__('datetime').datetime.now().isoformat(), run_id,
             ))
             conn.commit()
             conn.close()
@@ -349,8 +350,8 @@ class AutoTrader:
             conn = get_conn()
             c = conn.cursor()
             c.execute(
-                "UPDATE auto_runs SET llm_summary = ?, completed_at = datetime('now') WHERE id = ?",
-                (f"ERROR: {e}", run_id),
+                "UPDATE auto_runs SET llm_summary = %s, completed_at = %s WHERE id = %s",
+                (f"ERROR: {e}", __import__('datetime').datetime.now().isoformat(), run_id),
             )
             conn.commit()
             conn.close()
@@ -444,17 +445,17 @@ Return ONLY valid JSON (no markdown fences):
         c.execute("""
             INSERT INTO auto_positions
             (portfolio_id, ticker, company_name, shares, entry_price, entry_date, reason, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
         """, (self.portfolio_id, ticker, company_name, shares, price, date.today().isoformat(), reason))
 
         c.execute("""
             INSERT INTO auto_trades
             (portfolio_id, run_id, ticker, action, shares, price, trade_date, reason)
-            VALUES (?, ?, ?, 'buy', ?, ?, ?, ?)
+            VALUES (%s, %s, %s, 'buy', %s, %s, %s, %s)
         """, (self.portfolio_id, run_id, ticker, shares, price, date.today().isoformat(), reason))
 
         c.execute(
-            "UPDATE auto_portfolio SET cash_remaining = cash_remaining - ? WHERE id = ?",
+            "UPDATE auto_portfolio SET cash_remaining = cash_remaining - %s WHERE id = %s",
             (cost, self.portfolio_id),
         )
         conn.commit()
@@ -475,19 +476,19 @@ Return ONLY valid JSON (no markdown fences):
         c = conn.cursor()
         c.execute("""
             UPDATE auto_positions
-            SET status = ?, sell_price = ?, sell_date = ?
-            WHERE id = ?
+            SET status = %s, sell_price = %s, sell_date = %s
+            WHERE id = %s
         """, (close_status, price, date.today().isoformat(), pos["id"]))
 
         c.execute("""
             INSERT INTO auto_trades
             (portfolio_id, run_id, ticker, action, shares, price, trade_date, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (self.portfolio_id, run_id, pos["ticker"], action,
               pos["shares"], price, date.today().isoformat(), reason))
 
         c.execute(
-            "UPDATE auto_portfolio SET cash_remaining = cash_remaining + ? WHERE id = ?",
+            "UPDATE auto_portfolio SET cash_remaining = cash_remaining + %s WHERE id = %s",
             (proceeds, self.portfolio_id),
         )
         conn.commit()

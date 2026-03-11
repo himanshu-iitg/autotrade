@@ -114,14 +114,14 @@ def screen_stocks_for_theme(
     # Clear cache if forced
     if force:
         c.execute(
-            "DELETE FROM screened_stocks WHERE session_date = ? AND theme_id = ?",
+            "DELETE FROM screened_stocks WHERE session_date = %s AND theme_id = %s",
             (today, theme_id)
         )
         conn.commit()
 
     # Check DB cache (avoids repeat yfinance calls for same theme today)
     cached = c.execute(
-        "SELECT * FROM screened_stocks WHERE session_date = ? AND theme_id = ?",
+        "SELECT * FROM screened_stocks WHERE session_date = %s AND theme_id = %s",
         (today, theme_id)
     ).fetchall()
     if cached:
@@ -215,10 +215,11 @@ def screen_stocks_for_theme(
     # Save to DB
     for r in results:
         c.execute("""
-            INSERT OR IGNORE INTO screened_stocks
+            INSERT INTO screened_stocks
             (session_date, theme_id, ticker, company_name, sector, market_cap_cr,
              pe, pb, roe, debt_equity, revenue_growth, eps_growth, current_price)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (session_date, theme_id, ticker) DO NOTHING
         """, (today, theme_id, r["ticker"], r["company_name"], r["sector"],
               r["market_cap_cr"], r["pe"], r["pb"], r["roe"], r["debt_equity"],
               r["revenue_growth"], r["eps_growth"], r["current_price"]))

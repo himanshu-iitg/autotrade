@@ -1,4 +1,5 @@
 anthropic>=0.40.0
+psycopg2-binary>=2.9
 feedparser>=6.0.11
 yfinance>=0.2.50
 pandas>=2.2.0

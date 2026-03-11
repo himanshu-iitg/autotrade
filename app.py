@@ -183,16 +183,15 @@ elif page == "News Feed":
     # Query
     from modules.db import get_conn as _gc
     conn2 = _gc()
-    conn2.row_factory = __import__('sqlite3').Row
     c2 = conn2.cursor()
 
-    placeholders = ",".join("?" * len(selected_sources)) if selected_sources else "''"
+    placeholders = ",".join(["%s"] * len(selected_sources)) if selected_sources else "NULL"
     query = f"""
         SELECT source, title, summary, link, published_at, fetched_at
         FROM news
         WHERE source IN ({placeholders})
         ORDER BY fetched_at DESC
-        LIMIT ?
+        LIMIT %s
     """
     params = list(selected_sources) + [limit]
     rows = c2.execute(query, params).fetchall() if selected_sources else []

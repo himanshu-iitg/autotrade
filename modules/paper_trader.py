@@ -12,9 +12,10 @@ def create_strategy(name: str, theme: str, virtual_capital: float, notes: str = 
     c = conn.cursor()
     c.execute("""
         INSERT INTO strategies (name, theme, virtual_capital, notes, status)
-        VALUES (?, ?, ?, ?, 'active')
+        VALUES (%s, %s, %s, %s, 'active')
+        RETURNING id
     """, (name, theme, virtual_capital, notes))
-    strategy_id = c.lastrowid
+    strategy_id = c.fetchone()["id"]
     conn.commit()
     conn.close()
     return strategy_id
@@ -31,7 +32,7 @@ def get_all_strategies() -> list[dict]:
 def get_strategy(strategy_id: int) -> dict | None:
     conn = get_conn()
     c = conn.cursor()
-    row = c.execute("SELECT * FROM strategies WHERE id = ?", (strategy_id,)).fetchone()
+    row = c.execute("SELECT * FROM strategies WHERE id = %s", (strategy_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
@@ -40,8 +41,8 @@ def close_strategy(strategy_id: int):
     conn = get_conn()
     c = conn.cursor()
     c.execute(
-        "UPDATE strategies SET status = 'closed', closed_at = datetime('now') WHERE id = ?",
-        (strategy_id,)
+        "UPDATE strategies SET status = 'closed', closed_at = %s WHERE id = %s",
+        (datetime.now().isoformat(), strategy_id)
     )
     conn.commit()
     conn.close()
@@ -56,9 +57,10 @@ def add_trade(strategy_id: int, ticker: str, company_name: str,
     c = conn.cursor()
     c.execute("""
         INSERT INTO trades (strategy_id, ticker, company_name, shares, buy_price, buy_date)
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
     """, (strategy_id, ticker, company_name, shares, buy_price, date.today().isoformat()))
-    trade_id = c.lastrowid
+    trade_id = c.fetchone()["id"]
     conn.commit()
     conn.close()
     return trade_id
@@ -68,7 +70,7 @@ def close_trade(trade_id: int, sell_price: float):
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        UPDATE trades SET sell_price = ?, sell_date = ? WHERE id = ?
+        UPDATE trades SET sell_price = %s, sell_date = %s WHERE id = %s
     """, (sell_price, date.today().isoformat(), trade_id))
     conn.commit()
     conn.close()
@@ -78,7 +80,7 @@ def get_open_trades(strategy_id: int) -> list[dict]:
     conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
-        "SELECT * FROM trades WHERE strategy_id = ? AND sell_date IS NULL",
+        "SELECT * FROM trades WHERE strategy_id = %s AND sell_date IS NULL",
         (strategy_id,)
     ).fetchall()
     conn.close()
@@ -88,7 +90,7 @@ def get_open_trades(strategy_id: int) -> list[dict]:
 def get_all_trades(strategy_id: int) -> list[dict]:
     conn = get_conn()
     c = conn.cursor()
-    rows = c.execute("SELECT * FROM trades WHERE strategy_id = ?", (strategy_id,)).fetchall()
+    rows = c.execute("SELECT * FROM trades WHERE strategy_id = %s", (strategy_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -165,8 +167,12 @@ def save_daily_snapshot(strategy_id: int, portfolio_value: float, cash_remaining
     conn = get_conn()
     c = conn.cursor()
     c.execute("""
-        INSERT OR REPLACE INTO daily_snapshots (strategy_id, snapshot_date, portfolio_value, cash_remaining, nifty_value)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO daily_snapshots (strategy_id, snapshot_date, portfolio_value, cash_remaining, nifty_value)
+        VALUES (%s, %s, %s, %s, %s)
+        ON CONFLICT (strategy_id, snapshot_date) DO UPDATE SET
+            portfolio_value = EXCLUDED.portfolio_value,
+            cash_remaining  = EXCLUDED.cash_remaining,
+            nifty_value     = EXCLUDED.nifty_value
     """, (strategy_id, today, portfolio_value, cash_remaining, nifty_value))
     conn.commit()
     conn.close()
@@ -176,7 +182,7 @@ def get_daily_snapshots(strategy_id: int) -> list[dict]:
     conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
-        "SELECT * FROM daily_snapshots WHERE strategy_id = ? ORDER BY snapshot_date",
+        "SELECT * FROM daily_snapshots WHERE strategy_id = %s ORDER BY snapshot_date",
         (strategy_id,)
     ).fetchall()
     conn.close()

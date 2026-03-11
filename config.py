@@ -21,6 +21,7 @@ def _secret(key: str) -> str:
 
 ANTHROPIC_API_KEY = _secret("ANTHROPIC_API_KEY")
 GEMINI_API_KEY    = _secret("GEMINI_API_KEY")
+DATABASE_URL      = _secret("DATABASE_URL")
 
 # RSS Feed URLs for Indian financial news
 # Note: ET Markets and NSE Official block bots and return HTML — replaced with working feeds
