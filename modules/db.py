@@ -46,7 +46,12 @@ class _Conn:
 
 
 def get_conn() -> _Conn:
-    conn = psycopg2.connect(DATABASE_URL)
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add it to .streamlit/secrets.toml (local) "
+            "or Streamlit Cloud app Settings → Secrets."
+        )
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
     return _Conn(conn)
 
 
