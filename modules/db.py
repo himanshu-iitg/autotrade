@@ -1,6 +1,7 @@
 """PostgreSQL database initialization and helpers (Supabase)."""
 import psycopg2
 import psycopg2.extras
+from urllib.parse import urlparse
 from config import DATABASE_URL
 
 
@@ -51,7 +52,15 @@ def get_conn() -> _Conn:
             "DATABASE_URL is not set. Add it to .streamlit/secrets.toml (local) "
             "or Streamlit Cloud app Settings → Secrets."
         )
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    r = urlparse(DATABASE_URL)
+    conn = psycopg2.connect(
+        host=r.hostname,
+        port=r.port or 5432,
+        dbname=r.path.lstrip("/"),
+        user=r.username,
+        password=r.password,
+        sslmode="require",
+    )
     return _Conn(conn)
 
 
