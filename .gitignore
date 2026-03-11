@@ -1,0 +1,33 @@
+# ── Secrets ─────────────────────────────────────────────────────────────────
+.env
+.streamlit/secrets.toml
+
+# ── Local database (user-specific, rebuilt at runtime) ───────────────────────
+db/stocks.db
+
+# ── Python cache ─────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+.env/
+
+# ── OS / Editor junk ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ── Claude Code project files ─────────────────────────────────────────────────
+.claude/
+
+# ── Windows-only launch script (not needed on Streamlit Cloud) ───────────────
+run.bat
