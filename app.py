@@ -1,851 +1,1032 @@
-"""Main Streamlit app — Top-Down NSE/BSE Stock Analysis."""
-import sys
-import json
-import streamlit as st
+"""
+NSE Stock Advisor — Streamlit app.
 
-# Fix Windows cp1252 console so Unicode chars (₹ etc.) don't crash print() calls
+Flow: Screen → Triage → Suggestions → Act
+"""
+import sys, json, hashlib, math
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-import pandas as pd
-import plotly.graph_objects as go
-import plotly.express as px
 
 from modules.db import init_db
-from modules.news_fetcher import fetch_all_feeds, get_recent_headlines
-from modules.theme_engine import extract_themes
-from modules.screener import screen_stocks_for_theme
-from modules.stock_detail import get_price_history, get_stock_info, generate_stock_thesis, get_key_metrics, summarize_top_picks
+from modules.news_fetcher import fetch_all_feeds
+from modules.screener import screen_nifty500, get_recently_seen_tickers
+from modules.news_triage import triage_stock, _get_sector_config
+from modules.stock_detail import (
+    get_price_history, get_stock_info,
+    generate_stock_thesis, get_key_metrics, summarize_top_picks,
+)
 from modules.paper_trader import (
     create_strategy, get_all_strategies, close_strategy,
     add_trade, close_trade, get_open_trades, get_all_trades,
     compute_portfolio_value, save_daily_snapshot, update_all_snapshots,
-    get_daily_snapshots, compare_strategies, get_strategy
+    get_daily_snapshots, compare_strategies,
 )
 from modules.auto_trader import AutoTrader
 from modules.llm_client import provider_label
 from config import SCREENER_DEFAULTS, ANTHROPIC_API_KEY, GEMINI_API_KEY
 
-# ─── Page Config ─────────────────────────────────────────────────────────────
+# ── Screening Presets ─────────────────────────────────────────────────────────
+
+SCREENING_PRESETS = {
+    "Value Hunt": {
+        "icon": "💰",
+        "tagline": "Profitable quality, trading cheap",
+        "description": "High ROE, low P/E, low debt. Best when markets are fairly valued or overheated — forces you to find genuinely cheap quality.",
+        "filters": {"min_market_cap_cr": 2000, "max_pe": 20, "min_pe": 5, "max_debt_equity": 1.0, "min_roe_pct": 12},
+        "sectors": None,
+    },
+    "Growth Compounder": {
+        "icon": "🚀",
+        "tagline": "Pay up for high-quality growth",
+        "description": "Strong revenue growth + high ROE. Willing to pay a higher P/E for businesses that keep compounding. Best in bull markets.",
+        "filters": {"min_market_cap_cr": 1000, "max_pe": 55, "max_debt_equity": 1.5, "min_roe_pct": 18, "min_revenue_growth_pct": 10},
+        "sectors": None,
+    },
+    "Quality Defensive": {
+        "icon": "🛡️",
+        "tagline": "Large-cap safety in uncertain markets",
+        "description": "Only large caps, very low debt, strong ROE. For when you want to stay invested but reduce risk — consolidation or correction phases.",
+        "filters": {"min_market_cap_cr": 10000, "max_pe": 40, "max_debt_equity": 0.5, "min_roe_pct": 15},
+        "sectors": None,
+    },
+    "Mid Cap Opportunity": {
+        "icon": "📈",
+        "tagline": "Higher risk, higher potential",
+        "description": "Smaller but profitable companies with room to run. Best in risk-on markets with strong domestic liquidity.",
+        "filters": {"min_market_cap_cr": 500, "max_pe": 45, "max_debt_equity": 1.5, "min_roe_pct": 10},
+        "sectors": None,
+    },
+    "Capex Cycle": {
+        "icon": "⚙️",
+        "tagline": "Riding India's investment boom",
+        "description": "Capital goods, infra, power — sectors that win when government or private capex is rising. PLI, railways, defence.",
+        "filters": {"min_market_cap_cr": 1000, "max_pe": 60, "max_debt_equity": 2.0, "min_revenue_growth_pct": 8},
+        "sectors": ["CAPITAL GOODS", "CONSTRUCTION", "POWER", "CONSTRUCTION MATERIALS"],
+    },
+    "Export Winners": {
+        "icon": "🌍",
+        "tagline": "USD earners — play the weak rupee",
+        "description": "IT, pharma, chemicals — revenue in dollars, costs in rupees. Best when INR is under pressure or global demand is recovering.",
+        "filters": {"min_market_cap_cr": 1000, "max_pe": 35, "max_debt_equity": 0.8, "min_roe_pct": 14},
+        "sectors": ["INFORMATION TECHNOLOGY", "HEALTHCARE", "CHEMICALS"],
+    },
+    "Financials Focus": {
+        "icon": "🏦",
+        "tagline": "Banks & NBFCs — play the rate cycle",
+        "description": "Rate-sensitive plays. Best when RBI is cutting rates or credit growth is accelerating. Watch repo rate and NPA trends.",
+        "filters": {"min_market_cap_cr": 2000, "max_pe": 25, "max_debt_equity": 10.0, "min_roe_pct": 12},
+        "sectors": ["FINANCIAL SERVICES"],
+    },
+    "Consumption India": {
+        "icon": "🛒",
+        "tagline": "Domestic demand — urban + rural",
+        "description": "FMCG, auto, consumer durables. Best after a good monsoon, rural income boost, or urban wage growth cycle.",
+        "filters": {"min_market_cap_cr": 2000, "max_pe": 50, "max_debt_equity": 1.0, "min_roe_pct": 12},
+        "sectors": ["FAST MOVING CONSUMER GOODS", "AUTOMOBILE AND AUTO COMPONENTS", "CONSUMER DURABLES", "CONSUMER SERVICES"],
+    },
+}
+
+PRESET_NAMES = list(SCREENING_PRESETS.keys())
+
+_DAY_RATIONALE = {
+    0: "Start of week — good time for a growth-oriented screen before markets pick up momentum.",
+    1: "Tuesday — mid-week, useful to hunt for value before mid-week volatility.",
+    2: "Wednesday — mid-week, consider defensive or export plays.",
+    3: "Thursday — pre-weekend, good to look at sector-specific opportunities.",
+    4: "Friday — end of week review, quality defensive or mid-cap discovery works well.",
+    5: "Weekend — great time to explore mid-cap opportunities without time pressure.",
+    6: "Sunday — plan your week ahead with a growth or value screen.",
+}
+
+
+def get_today_preset() -> str:
+    """Rotate preset daily — deterministic by date, different every day."""
+    from datetime import date
+    h = int(hashlib.md5(date.today().isoformat().encode()).hexdigest(), 16)
+    return PRESET_NAMES[h % len(PRESET_NAMES)]
+
+
+def sentiment_badge(sentiment: str) -> str:
+    return {"POSITIVE": "🟢", "NEUTRAL": "🟡", "NEGATIVE": "🔴"}.get(sentiment, "⚪")
+
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+
 st.set_page_config(
-    page_title="NSE Top-Down Investor",
-    page_icon="📈",
+    page_title="NSE Stock Advisor",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-# ─── Initialize DB ────────────────────────────────────────────────────────────
 init_db()
 
-# ─── Sidebar Navigation ───────────────────────────────────────────────────────
-st.sidebar.title("NSE Top-Down Investor")
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+
+st.sidebar.title("📊 NSE Stock Advisor")
 page = st.sidebar.radio(
     "Navigate",
-    ["Today's Themes", "News Feed", "Screen Stocks", "Stock Deep Dive", "Paper Trading", "Strategy Comparison", "Auto Trader"],
+    ["🔍 Screen", "📰 Triage", "💡 Suggestions", "📊 Portfolio", "⚙️ Auto Trader", "📡 News Feed"],
     index=0,
 )
-
 st.sidebar.markdown("---")
 
-# ─── LLM Provider Selector ────────────────────────────────────────────────────
 st.sidebar.markdown("**LLM Provider**")
-
-# Determine which providers are configured
 provider_options = []
-if GEMINI_API_KEY:
-    provider_options.append("gemini")
-if ANTHROPIC_API_KEY:
-    provider_options.append("claude")
-if not provider_options:
-    provider_options = ["gemini"]  # show even if unconfigured, will fail gracefully
-
-provider_labels = {
-    "claude": "Claude (Anthropic) — paid, best quality",
-    "gemini": "Gemini 2.5 Flash Lite (Google) — free tier",
-}
+if GEMINI_API_KEY:    provider_options.append("gemini")
+if ANTHROPIC_API_KEY: provider_options.append("claude")
+if not provider_options: provider_options = ["gemini"]
 
 selected_provider = st.sidebar.radio(
-    "Use for theme extraction & thesis:",
+    "Use for triage & thesis:",
     options=provider_options,
-    format_func=lambda p: provider_labels.get(p, p),
+    format_func=lambda p: {"claude": "Claude Sonnet — paid, best quality",
+                            "gemini": "Gemini 2.5 Flash Lite — free tier"}.get(p, p),
     key="llm_provider",
 )
 
-if selected_provider == "gemini" and not GEMINI_API_KEY:
-    st.sidebar.warning("GEMINI_API_KEY not set in .env")
-if selected_provider == "claude" and not ANTHROPIC_API_KEY:
-    st.sidebar.warning("ANTHROPIC_API_KEY not set in .env")
-
 st.sidebar.markdown("---")
-if st.sidebar.button("Refresh News + Update P&L", type="primary"):
-    with st.spinner("Fetching latest news..."):
+if st.sidebar.button("🔄 Refresh News DB", type="primary"):
+    with st.spinner("Fetching…"):
         n = fetch_all_feeds()
-        st.sidebar.success(f"Fetched {n} new articles")
-    with st.spinner("Updating portfolio snapshots..."):
+        st.sidebar.success(f"{n} new articles")
+if st.sidebar.button("📸 Update Snapshots"):
+    with st.spinner("Updating…"):
         update_all_snapshots()
-        st.sidebar.success("Snapshots updated")
+        st.sidebar.success("Done")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 1: TODAY'S THEMES
+# PAGE 1: SCREEN
 # ═══════════════════════════════════════════════════════════════════════════════
-if page == "Today's Themes":
-    st.title("Today's Macro Investment Themes")
-    st.caption("Extracted from Indian financial news (ET, Moneycontrol, Livemint, NSE) using Claude Haiku")
+if page == "🔍 Screen":
+    from datetime import date
 
-    col1, col2 = st.columns([2, 1])
+    st.title("🔍 Screen")
+    st.caption("Choose a screening strategy → run → proceed to triage")
 
-    with col1:
-        refresh = st.button("Extract Themes from Today's News", type="primary")
+    today_preset_name = get_today_preset()
+    today_preset      = SCREENING_PRESETS[today_preset_name]
+    dow               = date.today().weekday()
 
-    with col2:
-        force = st.checkbox("Force re-extract (ignore cache)")
-
-    provider = st.session_state.get("llm_provider", "claude")
-    model_label = "Gemini 2.5 Flash Lite" if provider == "gemini" else "Claude Haiku"
-
-    if refresh:
-        with st.spinner("Fetching news feeds..."):
-            n = fetch_all_feeds()
-            st.info(f"Fetched {n} new articles")
-
-        with st.spinner(f"Analyzing with {model_label}..."):
-            try:
-                # Always extract on button click; force=True also clears existing cache
-                themes = extract_themes(force_refresh=True, provider=provider)
-                if themes:
-                    st.success(f"Found {len(themes)} investment themes")
-                else:
-                    st.warning("No headlines found. Click 'Refresh News' first.")
-            except RuntimeError as e:
-                st.error(f"**LLM Error ({provider}):** {e}")
-                themes = []
-
-    # Load cached themes — never calls LLM, returns [] if nothing extracted yet
-    themes = extract_themes(force_refresh=False, provider=provider)
-
-    if not themes:
-        st.info(f"Click **'Extract Themes from Today's News'** to begin.  \nSelected model: **{model_label}**")
-        st.stop()
-
-    st.markdown("---")
-    for i, t in enumerate(themes):
-        conf_color = "green" if t["confidence"] > 0.75 else "orange" if t["confidence"] > 0.5 else "red"
-        with st.expander(
-            f"**{t['theme']}** — Confidence: :{conf_color}[{t['confidence']:.0%}]",
-            expanded=(i < 3)
-        ):
-            col_ev, col_sec = st.columns([3, 2])
-            with col_ev:
-                st.markdown("**Supporting Evidence:**")
-                for ev in t["evidence"]:
-                    st.markdown(f"- {ev}")
-            with col_sec:
-                st.markdown("**Sectors to explore:**")
-                for sec in t["sectors"]:
-                    st.markdown(f"- {sec}")
-
-    # Show recent headlines count
-    headlines = get_recent_headlines(hours_back=48)
-    st.sidebar.info(f"Headlines in DB: {len(headlines)}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 2: NEWS FEED
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "News Feed":
-    st.title("News Feed")
-    st.caption("All headlines fetched from Indian financial RSS feeds (last 48 hours)")
-
-    from modules.db import get_conn
-    conn = get_conn()
-    c = conn.cursor()
-
-    # Filter controls
-    col_src, col_search, col_limit = st.columns([2, 3, 1])
-    with col_src:
-        sources = [r[0] for r in c.execute("SELECT DISTINCT source FROM news ORDER BY source").fetchall()]
-        selected_sources = st.multiselect("Filter by source:", sources, default=sources)
-    with col_search:
-        search_term = st.text_input("Search headlines:", placeholder="e.g. RBI, SEBI, inflation")
-    with col_limit:
-        limit = st.selectbox("Show:", [50, 100, 200, 500], index=1)
-
-    conn.close()
-
-    if st.button("Refresh News Now", type="primary"):
-        with st.spinner("Fetching RSS feeds..."):
-            n = fetch_all_feeds()
-            st.success(f"Fetched {n} new articles")
-        st.rerun()
-
-    # Query
-    from modules.db import get_conn as _gc
-    conn2 = _gc()
-    c2 = conn2.cursor()
-
-    placeholders = ",".join(["%s"] * len(selected_sources)) if selected_sources else "NULL"
-    query = f"""
-        SELECT source, title, summary, link, published_at, fetched_at
-        FROM news
-        WHERE source IN ({placeholders})
-        ORDER BY fetched_at DESC
-        LIMIT %s
-    """
-    params = list(selected_sources) + [limit]
-    rows = c2.execute(query, params).fetchall() if selected_sources else []
-    conn2.close()
-
-    # Apply search filter
-    if search_term:
-        term = search_term.lower()
-        rows = [r for r in rows if term in r["title"].lower() or term in (r["summary"] or "").lower()]
-
-    st.markdown(f"**{len(rows)} articles** {'matching' if search_term else 'from'} selected sources")
-    st.markdown("---")
-
-    for r in rows:
-        with st.expander(f"[{r['source']}] {r['title']}", expanded=False):
-            if r["summary"]:
-                st.write(r["summary"][:300] + ("..." if len(r["summary"]) > 300 else ""))
-            col_l, col_t = st.columns([3, 1])
-            with col_l:
-                if r["link"]:
-                    st.markdown(f"[Read full article]({r['link']})")
-            with col_t:
-                ts = r["published_at"] or r["fetched_at"] or ""
-                st.caption(ts[:16])
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 3: SCREEN STOCKS
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Screen Stocks":
-    st.title("Screen NSE Stocks by Theme")
-
-    themes = extract_themes(force_refresh=False)
-    if not themes:
-        st.warning("No themes extracted yet. Go to 'Today's Themes' first.")
-        st.stop()
-
-    theme_names = [t["theme"] for t in themes]
-    selected_name = st.selectbox("Select a theme to screen for:", theme_names)
-    selected_theme = next(t for t in themes if t["theme"] == selected_name)
-
-    st.markdown(f"**Sectors:** {', '.join(selected_theme['sectors'])}")
-
-    # Screener filters
-    with st.expander("Adjust Screener Filters"):
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            min_mcap = st.number_input("Min Market Cap (₹ Cr)", value=SCREENER_DEFAULTS["min_market_cap_cr"], step=100)
-        with col2:
-            max_pe = st.number_input("Max P/E", value=float(SCREENER_DEFAULTS["max_pe"]), step=5.0)
-        with col3:
-            max_de = st.number_input("Max Debt/Equity", value=float(SCREENER_DEFAULTS["max_debt_equity"]), step=0.1)
-
-    col_btn, col_force = st.columns([3, 2])
+    # ── Today's suggestion card ───────────────────────────────────────────────
+    st.markdown("### Today's Suggested Screen")
+    col_icon, col_info, col_btn = st.columns([1, 6, 2])
+    with col_icon:
+        st.markdown(f"<div style='font-size:3rem;text-align:center;padding-top:8px'>"
+                    f"{today_preset['icon']}</div>", unsafe_allow_html=True)
+    with col_info:
+        st.markdown(f"**{today_preset_name}** — {today_preset['tagline']}")
+        st.caption(today_preset["description"])
+        st.caption(f"💡 {_DAY_RATIONALE[dow]}")
     with col_btn:
-        screen_btn = st.button("Screen Stocks", type="primary")
-    with col_force:
-        force_rescreen = st.checkbox(
-            "Force re-screen",
-            help="Clear today's cached results and re-fetch from Nifty 500 (useful when changing filters)"
-        )
+        st.write("")
+        st.write("")
+        if st.button(f"Use this →", type="primary", key="use_today"):
+            st.session_state["selected_preset"] = today_preset_name
+            st.rerun()
 
-    if screen_btn:
-        with st.spinner(f"Screening Nifty 500 for '{selected_name}'... (fetching fundamentals via yfinance, please wait)"):
-            filters = {"min_market_cap_cr": min_mcap, "max_pe": max_pe, "max_debt_equity": max_de}
-            stocks = screen_stocks_for_theme(
-                theme_id=selected_theme["id"],
-                theme_name=selected_name,
-                sectors=selected_theme["sectors"],
-                filters=filters,
-                force=force_rescreen,
+    st.markdown("---")
+
+    # ── Preset grid ───────────────────────────────────────────────────────────
+    st.markdown("### Or choose a different strategy")
+    selected_preset = st.session_state.get("selected_preset", today_preset_name)
+
+    grid_cols = st.columns(4)
+    for i, (name, preset) in enumerate(SCREENING_PRESETS.items()):
+        with grid_cols[i % 4]:
+            active   = (name == selected_preset)
+            bg       = "#1a3a5c" if active else "#0f1f2e"
+            border   = "#00d4ff" if active else "#2a4a6a"
+            st.markdown(
+                f"""<div style='border:1px solid {border};border-radius:8px;
+                    padding:10px 12px;background:{bg};margin-bottom:6px;min-height:88px'>
+                    <span style='font-size:1.3rem'>{preset['icon']}</span>
+                    <span style='font-weight:700;color:#e0e0e0;margin-left:6px'>{name}</span><br>
+                    <span style='font-size:0.75rem;color:#aaa'>{preset['tagline']}</span>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+            lbl = "✓ Active" if active else "Select"
+            if st.button(lbl, key=f"preset_{name}",
+                         type="primary" if active else "secondary",
+                         use_container_width=True):
+                st.session_state["selected_preset"] = name
+                st.rerun()
+
+    st.markdown("---")
+
+    # ── Active preset + filter customisation ──────────────────────────────────
+    preset  = SCREENING_PRESETS[selected_preset]
+    filters = dict(preset["filters"])
+    sectors = list(preset.get("sectors") or [])
+
+    st.markdown(f"### {preset['icon']} {selected_preset}")
+    st.markdown(f"*{preset['description']}*")
+
+    with st.expander("⚙️ Customise Filters", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            filters["min_market_cap_cr"] = st.number_input(
+                "Min MCap (₹Cr)", value=float(filters.get("min_market_cap_cr", 500)), step=500.0)
+        with c2:
+            filters["max_pe"] = st.number_input(
+                "Max P/E", value=float(filters.get("max_pe", 60)), step=5.0)
+        with c3:
+            filters["max_debt_equity"] = st.number_input(
+                "Max D/E", value=float(filters.get("max_debt_equity", 2.0)), step=0.25)
+        with c4:
+            filters["min_roe_pct"] = st.number_input(
+                "Min ROE %", value=float(filters.get("min_roe_pct", 0)), step=2.0)
+        c5, c6 = st.columns(2)
+        with c5:
+            filters["min_revenue_growth_pct"] = st.number_input(
+                "Min Rev Growth %",
+                value=float(filters.get("min_revenue_growth_pct", -100)), step=5.0)
+        with c6:
+            max_results_ui = st.slider("Max results", 10, 40, 20)
+
+        from config import NSE_SECTORS
+        sector_override = st.multiselect(
+            "Sector filter (blank = follow preset default)",
+            NSE_SECTORS, default=sectors)
+        if sector_override:
+            sectors = sector_override
+
+    col_d, col_e, col_f = st.columns(3)
+    with col_d:
+        discovery_mode = st.toggle("🎲 Discovery Mode",
+            help="Shuffle Nifty 500 order — surfaces different stocks each run")
+    with col_e:
+        exclude_recent = st.toggle("🚫 Exclude Recently Seen",
+            help="Skip tickers that appeared in any screen in the last 3 days")
+    with col_f:
+        force_refresh  = st.toggle("♻️ Force Re-screen",
+            help="Clear today's cache and re-fetch from yfinance")
+
+    st.markdown("")
+    if st.button("▶ Run Screen", type="primary"):
+        exclude_set = get_recently_seen_tickers(days_back=3) if exclude_recent else None
+        if exclude_set:
+            st.info(f"Excluding {len(exclude_set)} recently seen tickers")
+
+        with st.spinner(f"Screening Nifty 500 — **{selected_preset}** filters…"):
+            stocks = screen_nifty500(
+                sectors     = sectors if sectors else None,
+                filters     = filters,
+                max_results = max_results_ui,
+                force       = force_refresh or discovery_mode,
+                shuffle     = discovery_mode,
+                exclude_tickers = exclude_set,
             )
 
         if not stocks:
-            st.warning("No stocks matched the filters. Try relaxing the filters or a different theme.")
+            st.warning("No stocks passed. Try relaxing filters or a different preset.")
         else:
-            st.success(f"Found {len(stocks)} stocks matching theme: **{selected_name}**")
-            df = pd.DataFrame(stocks)
-            display_cols = {
-                "ticker": "Ticker",
-                "company_name": "Company",
-                "sector": "Sector",
-                "market_cap_cr": "Mkt Cap (₹Cr)",
-                "current_price": "Price (₹)",
-                "pe": "P/E",
-                "pb": "P/B",
-                "roe": "ROE %",
-                "debt_equity": "D/E",
-                "revenue_growth": "Rev Growth %",
-                "eps_growth": "EPS Growth %",
-            }
-            df_display = df[[c for c in display_cols if c in df.columns]].rename(columns=display_cols)
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-
-            # Store selection in session state for deep dive
             st.session_state["screened_stocks"] = stocks
-            st.session_state["current_theme"] = selected_name
-            st.info("Go to 'Stock Deep Dive' to analyze individual stocks.")
+            st.session_state["active_preset"]   = selected_preset
+            st.session_state["triaged_stocks"]  = []
+            st.success(f"✅ {len(stocks)} stocks passed **{selected_preset}** filters")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 3: STOCK DEEP DIVE
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Stock Deep Dive":
-    st.title("Stock Deep Dive")
-
+    # ── Results table ─────────────────────────────────────────────────────────
     stocks = st.session_state.get("screened_stocks", [])
-    theme_name = st.session_state.get("current_theme", "")
+    if stocks:
+        active = st.session_state.get("active_preset", "")
+        st.markdown(f"#### Results — {active} ({len(stocks)} stocks)")
+        df = pd.DataFrame(stocks)
+        display_cols = {
+            "ticker": "Ticker", "company_name": "Company", "sector": "Sector",
+            "market_cap_cr": "MCap ₹Cr", "current_price": "Price ₹",
+            "pe": "P/E", "roe": "ROE %", "debt_equity": "D/E",
+            "revenue_growth": "Rev Gth %", "eps_growth": "EPS Gth %",
+        }
+        st.dataframe(
+            df[[c for c in display_cols if c in df.columns]].rename(columns=display_cols),
+            use_container_width=True, hide_index=True,
+        )
+        st.markdown("---")
+        col_next, col_info = st.columns([2, 5])
+        with col_next:
+            if st.button("📰 Proceed to Triage →", type="primary", use_container_width=True):
+                st.session_state["_nav"] = "📰 Triage"
+                st.rerun()
+        with col_info:
+            st.caption("Triage analyses sector-specific signals per stock "
+                       "(repo rate for banks, FDA for pharma, etc.) before AI suggestions.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 2: TRIAGE
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "📰 Triage":
+    st.title("📰 Triage")
+    st.caption("Sector-aware news analysis — the right signals for each stock, not generic headlines")
+
+    provider = st.session_state.get("llm_provider", "gemini")
+    stocks   = st.session_state.get("screened_stocks", [])
 
     if not stocks:
-        st.warning("Screen stocks first (Page 2), then come here to analyze.")
+        st.info("No screened stocks yet. Go to **🔍 Screen** first.")
+        st.stop()
+
+    preset = st.session_state.get("active_preset", "")
+    st.markdown(f"**{len(stocks)} stocks** from *{preset}* ready for triage")
+
+    # Show what signals will be checked
+    sectors_present = sorted({s.get("sector", "") for s in stocks if s.get("sector")})
+    if sectors_present:
+        with st.expander("💡 Signals being monitored per sector", expanded=False):
+            for sec in sectors_present:
+                cfg     = _get_sector_config(sec)
+                signals = " · ".join(cfg["signals"][:4])
+                st.markdown(f"**{sec}**: {signals}")
+
+    col_n, col_rn = st.columns([3, 2])
+    with col_n:
+        top_n = st.slider("Triage top N stocks", 5, len(stocks), min(12, len(stocks)))
+    with col_rn:
+        refresh_news = st.checkbox("Refresh news DB first", value=False)
+
+    if st.button("▶ Run Triage", type="primary"):
+        if refresh_news:
+            with st.spinner("Refreshing news DB…"):
+                fetch_all_feeds()
+
+        progress_bar = st.progress(0, text="Starting…")
+        status_box   = st.empty()
+        triaged      = []
+
+        to_triage = [dict(s) for s in stocks[:top_n]]
+        rest      = [dict(s) for s in stocks[top_n:]]
+
+        for i, stock in enumerate(to_triage):
+            ticker = stock.get("ticker", "?")
+            sector = stock.get("sector", "")
+            pct    = int(i / len(to_triage) * 100)
+            progress_bar.progress(pct, text=f"Triaging {ticker} ({sector})…")
+            status_box.caption(
+                f"Checking sector signals for **{stock.get('company_name', ticker)}**…")
+            enriched = triage_stock(stock, provider=provider, pause=0.4)
+            triaged.append(enriched)
+
+        progress_bar.progress(100, text="Triage complete ✅")
+        status_box.empty()
+
+        for s in rest:
+            s.update({
+                "triage_sentiment": "NEUTRAL", "triage_confidence": 0.0,
+                "triage_catalyst": "not triaged", "triage_risk": "not triaged",
+                "triage_signal_hits": [], "triage_summary": "Not triaged.",
+                "triage_news_count": 0,
+            })
+
+        sentiment_order = {"POSITIVE": 0, "NEUTRAL": 1, "NEGATIVE": 2}
+        triaged.sort(key=lambda s: (
+            sentiment_order.get(s.get("triage_sentiment", "NEUTRAL"), 1),
+            -(s.get("triage_confidence", 0)),
+            -(s.get("market_cap_cr", 0)),
+        ))
+
+        all_stocks = triaged + rest
+        st.session_state["triaged_stocks"] = all_stocks
+
+        pos  = sum(1 for s in triaged if s.get("triage_sentiment") == "POSITIVE")
+        neg  = sum(1 for s in triaged if s.get("triage_sentiment") == "NEGATIVE")
+        neut = len(triaged) - pos - neg
+        st.success(f"Done — 🟢 {pos} Positive · 🟡 {neut} Neutral · 🔴 {neg} Negative")
+
+    # ── Triage results ────────────────────────────────────────────────────────
+    triaged_stocks = st.session_state.get("triaged_stocks", [])
+    if triaged_stocks:
+        st.markdown("---")
+
+        cp, cn, cne = st.columns(3)
+        pos  = sum(1 for s in triaged_stocks if s.get("triage_sentiment") == "POSITIVE")
+        neg  = sum(1 for s in triaged_stocks if s.get("triage_sentiment") == "NEGATIVE")
+        neut = len(triaged_stocks) - pos - neg
+        cp.metric("🟢 Positive", pos)
+        cn.metric("🟡 Neutral", neut)
+        cne.metric("🔴 Negative", neg)
+
+        st.markdown("")
+        rows = []
+        for s in triaged_stocks:
+            sent = s.get("triage_sentiment", "NEUTRAL")
+            rows.append({
+                "":           sentiment_badge(sent),
+                "Ticker":     s.get("ticker", ""),
+                "Company":    (s.get("company_name") or "")[:28],
+                "Sector":     (s.get("sector") or "")[:18],
+                "Sentiment":  sent,
+                "Confidence": f"{s.get('triage_confidence', 0):.0%}",
+                "MCap ₹Cr":   s.get("market_cap_cr", 0),
+                "P/E":        s.get("pe"),
+                "ROE %":      s.get("roe"),
+                "Catalyst":   (s.get("triage_catalyst") or "")[:55],
+                "Risk":       (s.get("triage_risk") or "")[:55],
+                "Summary":    (s.get("triage_summary") or "")[:80],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        col_next, col_info = st.columns([2, 5])
+        with col_next:
+            if st.button("💡 Proceed to Suggestions →", type="primary", use_container_width=True):
+                st.session_state["_nav"] = "💡 Suggestions"
+                st.rerun()
+        with col_info:
+            st.caption("Suggestions will rank POSITIVE stocks and generate AI investment theses.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAGE 3: SUGGESTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+elif page == "💡 Suggestions":
+    st.title("💡 Suggestions")
+    st.caption("AI-ranked picks from triage results — deep dive and add to portfolio")
+
+    provider       = st.session_state.get("llm_provider", "gemini")
+    triaged_stocks = st.session_state.get("triaged_stocks", [])
+    preset         = st.session_state.get("active_preset", "")
+
+    if not triaged_stocks:
+        st.info("Run **📰 Triage** first to get suggestions.")
         st.stop()
 
     # ── AI Top Picks ──────────────────────────────────────────────────────────
     st.markdown("### AI Top Picks")
-    provider = st.session_state.get("llm_provider", "claude")
-    picks_key = f"top_picks_{theme_name}"
+    positive  = [s for s in triaged_stocks if s.get("triage_sentiment") == "POSITIVE"]
+    neutral   = [s for s in triaged_stocks if s.get("triage_sentiment") == "NEUTRAL"]
+    pool      = (positive + neutral)[:10]
 
-    col_picks_btn, col_picks_label = st.columns([2, 3])
-    with col_picks_btn:
-        gen_picks = st.button(
-            "Analyse All & Surface Best Stocks",
-            type="primary",
-            help=f"Ask AI to review all {len(stocks)} screened stocks and highlight the 2-3 most compelling"
-        )
-    with col_picks_label:
+    picks_key = f"top_picks_{preset}"
+    cb, cl = st.columns([2, 4])
+    with cb:
+        gen_picks = st.button("🤖 Generate Top Picks", type="primary",
+                              help=f"AI reviews {len(pool)} triaged candidates")
+    with cl:
         if picks_key in st.session_state:
-            st.caption(f"Showing picks for theme: **{theme_name}**")
+            st.caption(f"Picks for **{preset}**")
 
     if gen_picks:
-        model_label = "Gemini 2.5 Flash Lite" if provider == "gemini" else "Claude Haiku"
-        with st.spinner(
-            f"Fetching live data from Yahoo Finance + Perplexity Finance "
-            f"(news, analyst views, AI analysis) for top stocks, "
-            f"then selecting with {model_label}..."
-        ):
+        model_lbl = "Gemini 2.5 Flash Lite" if provider == "gemini" else "Claude Sonnet"
+        with st.spinner(f"Analysing with {model_lbl}…"):
             try:
-                picks = summarize_top_picks(stocks, theme_name, provider=provider)
+                picks = summarize_top_picks(pool, preset, provider=provider)
                 st.session_state[picks_key] = picks
             except RuntimeError as e:
-                st.error(f"**LLM Error:** {e}")
+                st.error(f"LLM Error: {e}")
 
     if picks_key in st.session_state:
         picks = st.session_state[picks_key]
         if picks:
-            cols = st.columns(len(picks))
-            for col, pick in zip(cols, picks):
-                symbol = pick["ticker"].replace(".NS", "").replace(".BO", "")
-                yahoo_url = f"https://finance.yahoo.com/quote/{pick['ticker']}/"
-                google_url = f"https://www.google.com/finance/quote/{symbol}:NSE"
-                screener_url = f"https://www.screener.in/company/{symbol}/"
-                perplexity_url = f"https://www.perplexity.ai/finance/{symbol}.NS/analysis"
+            pick_cols = st.columns(len(picks))
+            for col, pick in zip(pick_cols, picks):
+                sym        = pick["ticker"].replace(".NS", "").replace(".BO", "")
+                ti         = next((s for s in triaged_stocks if s["ticker"] == pick["ticker"]), {})
+                sent       = ti.get("triage_sentiment", "NEUTRAL")
+                catalyst   = ti.get("triage_catalyst", "")
+                risk       = ti.get("triage_risk", "")
+                conf       = ti.get("triage_confidence", 0)
+                yahoo_url  = f"https://finance.yahoo.com/quote/{pick['ticker']}/"
+                scr_url    = f"https://www.screener.in/company/{sym}/"
+                perp_url   = f"https://www.perplexity.ai/finance/{sym}.NS/analysis"
                 with col:
                     st.markdown(
-                        f"""<div style="border:1px solid #3a5a7a; border-radius:8px; padding:16px; background:#0f2033;">
-                        <p style="font-size:1.05em; font-weight:700; color:#00d4ff; margin:0 0 2px 0;">{pick['company_name']}</p>
-                        <p style="font-size:0.78em; color:#888; margin:0 0 10px 0;">{pick['ticker']}</p>
-                        <p style="font-size:0.87em; line-height:1.55; color:#ddd; margin:0 0 14px 0;">{pick['reason']}</p>
-                        <p style="font-size:0.75em; margin:0; line-height:2;">
-                          <a href="{perplexity_url}" target="_blank" style="color:#a78bfa; margin-right:10px;">Perplexity ↗</a>
-                          <a href="{yahoo_url}" target="_blank" style="color:#4da6ff; margin-right:10px;">Yahoo Finance ↗</a>
-                          <a href="{google_url}" target="_blank" style="color:#4da6ff; margin-right:10px;">Google Finance ↗</a>
-                          <a href="{screener_url}" target="_blank" style="color:#4da6ff;">Screener.in ↗</a>
-                        </p>
-                        </div>""",
-                        unsafe_allow_html=True
+                        f"""<div style="border:1px solid #3a5a7a;border-radius:8px;
+                            padding:16px;background:#0f2033;margin-bottom:8px">
+                            <p style="font-size:1.05em;font-weight:700;color:#00d4ff;margin:0 0 2px 0">
+                              {sentiment_badge(sent)} {pick['company_name']}</p>
+                            <p style="font-size:0.78em;color:#888;margin:0 0 8px 0">
+                              {pick['ticker']} · {sent} {conf:.0%}</p>
+                            <p style="font-size:0.85em;color:#ddd;margin:0 0 6px 0">
+                              {pick['reason']}</p>
+                            <p style="font-size:0.75em;color:#4ade80;margin:0 0 2px 0">
+                              🟢 {catalyst or '–'}</p>
+                            <p style="font-size:0.75em;color:#f97316;margin:0 0 12px 0">
+                              ⚠️ {risk or '–'}</p>
+                            <p style="font-size:0.72em;margin:0;line-height:2">
+                              <a href="{perp_url}" target="_blank" style="color:#a78bfa;margin-right:8px">Perplexity ↗</a>
+                              <a href="{yahoo_url}" target="_blank" style="color:#4da6ff;margin-right:8px">Yahoo ↗</a>
+                              <a href="{scr_url}"  target="_blank" style="color:#4da6ff">Screener ↗</a>
+                            </p></div>""",
+                        unsafe_allow_html=True,
                     )
-        else:
-            st.warning("Could not generate picks — try again or check LLM provider settings.")
 
     st.markdown("---")
 
-    ticker_options = [f"{s['ticker']} — {s['company_name']}" for s in stocks]
-    selected = st.selectbox("Select stock for deep dive:", ticker_options)
-    ticker = selected.split(" — ")[0]
-    company_name = selected.split(" — ")[1]
+    # ── Deep Dive ─────────────────────────────────────────────────────────────
+    st.markdown("### Stock Deep Dive")
 
-    period = st.select_slider("Chart Period", options=["3mo", "6mo", "1y", "2y", "5y"], value="1y")
+    ticker_opts = [
+        f"{s['ticker']} — {s.get('company_name','')}  {sentiment_badge(s.get('triage_sentiment','NEUTRAL'))}"
+        for s in triaged_stocks
+    ]
+    selected     = st.selectbox("Select stock:", ticker_opts)
+    ticker       = selected.split(" — ")[0].strip()
+    company_name = selected.split(" — ")[1].split("  ")[0].strip()
+
+    ti          = next((s for s in triaged_stocks if s["ticker"] == ticker), {})
+    sentiment   = ti.get("triage_sentiment", "NEUTRAL")
+    catalyst    = ti.get("triage_catalyst", "")
+    risk        = ti.get("triage_risk", "")
+    triage_sum  = ti.get("triage_summary", "")
+    sig_hits    = ti.get("triage_signal_hits", [])
+    conf        = ti.get("triage_confidence", 0)
+
+    border_color = {"POSITIVE": "#22c55e", "NEGATIVE": "#ef4444"}.get(sentiment, "#eab308")
+    st.markdown(
+        f"""<div style="border-left:4px solid {border_color};padding:10px 16px;
+            background:#111827;border-radius:4px;margin-bottom:16px">
+            <b>{sentiment_badge(sentiment)} {sentiment}</b> ({conf:.0%} confidence)
+            &nbsp;·&nbsp; {triage_sum}<br>
+            <span style="color:#4ade80;font-size:0.8em">Catalyst: {catalyst or '–'}</span>
+            &nbsp;&nbsp;
+            <span style="color:#f97316;font-size:0.8em">Risk: {risk or '–'}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+    if sig_hits:
+        st.caption(f"Signals found: {' · '.join(sig_hits)}")
+
+    period = st.select_slider("Chart period", ["3mo","6mo","1y","2y","5y"], value="1y")
 
     col_chart, col_metrics = st.columns([3, 1])
-
-    with st.spinner(f"Loading data for {ticker}..."):
-        hist = get_price_history(ticker, period=period)
-        info = get_stock_info(ticker)
+    with st.spinner(f"Loading {ticker}…"):
+        hist    = get_price_history(ticker, period=period)
+        info    = get_stock_info(ticker)
         metrics = get_key_metrics(info)
 
     with col_chart:
         if not hist.empty:
             fig = go.Figure(data=[go.Candlestick(
-                x=hist["Date"],
-                open=hist["Open"], high=hist["High"],
-                low=hist["Low"], close=hist["Close"],
-                name=ticker
+                x=hist["Date"], open=hist["Open"], high=hist["High"],
+                low=hist["Low"], close=hist["Close"], name=ticker,
             )])
             fig.update_layout(
                 title=f"{company_name} ({ticker})",
                 xaxis_title="Date", yaxis_title="Price (₹)",
-                height=450,
-                xaxis_rangeslider_visible=False,
+                height=420, xaxis_rangeslider_visible=False,
                 template="plotly_dark",
             )
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.warning("Could not load price history.")
+            st.warning("Price history unavailable.")
 
     with col_metrics:
         st.markdown("**Key Metrics**")
         for k, v in metrics.items():
             st.markdown(f"**{k}:** {v}")
 
-    # AI Thesis
     st.markdown("---")
-    thesis_label = "Gemini 2.5 Flash Lite" if provider == "gemini" else "Claude Sonnet"
-    if st.button(f"Generate AI Investment Thesis ({thesis_label})", type="primary"):
-        with st.spinner(f"Generating thesis with {thesis_label}..."):
+    thesis_lbl = "Gemini 2.5 Flash Lite" if provider == "gemini" else "Claude Sonnet"
+    if st.button(f"📝 Generate Investment Thesis ({thesis_lbl})", type="primary"):
+        enriched_theme = f"{preset} · Triage: {sentiment} — {triage_sum}"
+        with st.spinner("Generating thesis…"):
             try:
-                thesis = generate_stock_thesis(ticker, company_name, theme_name, info, provider=provider)
+                thesis = generate_stock_thesis(ticker, company_name, enriched_theme, info, provider=provider)
                 st.session_state[f"thesis_{ticker}"] = thesis
             except RuntimeError as e:
-                st.error(f"**LLM Error:** {e}")
+                st.error(f"LLM Error: {e}")
 
     if f"thesis_{ticker}" in st.session_state:
-        st.markdown("### Investment Thesis")
+        st.markdown("#### Investment Thesis")
         st.markdown(st.session_state[f"thesis_{ticker}"])
 
-    # Quick add to paper portfolio
     st.markdown("---")
-    st.markdown("### Add to Paper Portfolio")
-
+    st.markdown("#### Add to Paper Portfolio")
     strategies = [s for s in get_all_strategies() if s["status"] == "active"]
     if strategies:
-        strategy_names = {s["id"]: s["name"] for s in strategies}
-        sel_sid = st.selectbox(
-            "Strategy to add to:",
-            options=list(strategy_names.keys()),
-            format_func=lambda x: strategy_names[x]
-        )
+        strat_names = {s["id"]: s["name"] for s in strategies}
+        sel_sid = st.selectbox("Strategy:", list(strat_names.keys()),
+                               format_func=lambda x: strat_names[x])
         try:
-            current_price = float(metrics.get("Current Price", "₹0").replace("₹", "").replace(",", "") or 0)
-        except (ValueError, TypeError):
-            current_price = 0.0
-        col_a, col_b = st.columns(2)
-        with col_a:
-            alloc_amount = st.number_input("Allocate amount (₹):", value=10000.0, step=1000.0)
-        with col_b:
-            buy_price = st.number_input("Buy price (₹):", value=current_price, step=0.5)
-        shares = alloc_amount / buy_price if buy_price > 0 else 0
-        st.caption(f"= {shares:.2f} shares @ ₹{buy_price:.2f}")
-
-        if st.button("Add to Portfolio"):
-            add_trade(sel_sid, ticker, company_name, round(shares, 4), buy_price)
-            st.success(f"Added {shares:.2f} shares of {ticker} to '{strategy_names[sel_sid]}'")
+            cur_price = float(
+                metrics.get("Current Price","₹0").replace("₹","").replace(",","") or 0)
+        except Exception:
+            cur_price = 0.0
+        ca, cb = st.columns(2)
+        with ca:
+            alloc = st.number_input("Allocate (₹):", value=10000.0, step=1000.0)
+        with cb:
+            buy_px = st.number_input("Buy price (₹):", value=cur_price, step=0.5)
+        shares = alloc / buy_px if buy_px > 0 else 0
+        st.caption(f"= {shares:.2f} shares @ ₹{buy_px:.2f}")
+        if st.button("➕ Add to Portfolio"):
+            add_trade(sel_sid, ticker, company_name, round(shares, 4), buy_px)
+            st.success(f"Added {shares:.2f} shares of {ticker} to '{strat_names[sel_sid]}'")
     else:
-        st.info("Create a paper trading strategy first (Page 4).")
+        st.info("Create a strategy first (📊 Portfolio).")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 4: PAPER TRADING
+# PAGE 4: PORTFOLIO
 # ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Paper Trading":
-    st.title("Paper Trading — Strategy Manager")
+elif page == "📊 Portfolio":
+    st.title("📊 Portfolio")
+    tab_create, tab_view, tab_trades, tab_compare = st.tabs(
+        ["Create Strategy", "Portfolio View", "Manage Trades", "Compare Strategies"])
 
-    tab_create, tab_portfolio, tab_trades = st.tabs(["Create Strategy", "Portfolio View", "Manage Trades"])
-
-    # ── Tab: Create Strategy ──────────────────────────────────────────────────
     with tab_create:
-        st.markdown("### Create a New Strategy Version")
+        st.markdown("### New Strategy")
         with st.form("new_strategy"):
-            strat_name = st.text_input("Strategy Name", placeholder="v1 Infrastructure Theme")
-            strat_theme = st.text_input("Theme/Thesis", placeholder="Capital goods & infra spending")
-            strat_capital = st.number_input("Virtual Capital (₹)", value=100000.0, step=10000.0)
-            strat_notes = st.text_area("Notes (optional)")
-            submitted = st.form_submit_button("Create Strategy", type="primary")
-
-        if submitted and strat_name:
-            sid = create_strategy(strat_name, strat_theme, strat_capital, strat_notes)
-            st.success(f"Created strategy **{strat_name}** (ID: {sid}) with ₹{strat_capital:,.0f} virtual capital")
+            sname    = st.text_input("Name", placeholder="v1 — Value Hunt May 2026")
+            stheme   = st.text_input("Thesis / Preset", placeholder="Value Hunt screen")
+            scapital = st.number_input("Virtual Capital (₹)", value=100000.0, step=10000.0)
+            snotes   = st.text_area("Notes (optional)")
+            if st.form_submit_button("Create Strategy", type="primary") and sname:
+                sid = create_strategy(sname, stheme, scapital, snotes)
+                st.success(f"Created **{sname}** (ID {sid}) with ₹{scapital:,.0f}")
 
         st.markdown("---")
-        st.markdown("### Active Strategies")
-        strategies = get_all_strategies()
-        if strategies:
-            for s in strategies:
-                col_a, col_b = st.columns([4, 1])
-                with col_a:
-                    status_icon = "✅" if s["status"] == "active" else "🔒"
-                    st.markdown(f"{status_icon} **{s['name']}** — Theme: {s['theme']} — Capital: ₹{s['virtual_capital']:,.0f}")
-                    st.caption(f"Created: {s['created_at'][:10]}")
-                with col_b:
-                    if s["status"] == "active":
-                        if st.button("Close", key=f"close_{s['id']}"):
-                            close_strategy(s["id"])
-                            st.rerun()
-        else:
-            st.info("No strategies yet.")
+        st.markdown("### All Strategies")
+        for s in get_all_strategies():
+            ca, cb = st.columns([4, 1])
+            with ca:
+                icon = "✅" if s["status"] == "active" else "🔒"
+                st.markdown(f"{icon} **{s['name']}** · {s['theme']} · ₹{s['virtual_capital']:,.0f}")
+                st.caption(f"Created: {s['created_at'][:10]}")
+            with cb:
+                if s["status"] == "active":
+                    if st.button("Close", key=f"close_{s['id']}"):
+                        close_strategy(s["id"])
+                        st.rerun()
 
-    # ── Tab: Portfolio View ───────────────────────────────────────────────────
-    with tab_portfolio:
+    with tab_view:
         strategies = [s for s in get_all_strategies() if s["status"] == "active"]
         if not strategies:
             st.info("No active strategies. Create one first.")
         else:
-            sel = st.selectbox(
-                "Select strategy:",
-                [s["id"] for s in strategies],
-                format_func=lambda x: next(s["name"] for s in strategies if s["id"] == x)
-            )
-            with st.spinner("Computing portfolio value..."):
+            sel = st.selectbox("Strategy:", [s["id"] for s in strategies],
+                               format_func=lambda x: next(s["name"] for s in strategies if s["id"] == x))
+            with st.spinner("Computing P&L…"):
                 summary = compute_portfolio_value(sel)
-
             if summary:
                 strat = summary["strategy"]
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Virtual Capital", f"₹{strat['virtual_capital']:,.0f}")
-                col2.metric("Portfolio Value", f"₹{summary['total_value']:,.0f}",
-                            f"{summary['total_pnl_pct']:+.2f}%")
-                col3.metric("Cash Remaining", f"₹{summary['cash_remaining']:,.0f}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Capital", f"₹{strat['virtual_capital']:,.0f}")
+                c2.metric("Value", f"₹{summary['total_value']:,.0f}", f"{summary['total_pnl_pct']:+.2f}%")
+                c3.metric("Cash", f"₹{summary['cash_remaining']:,.0f}")
                 nifty = summary.get("nifty_current")
-                col4.metric("Nifty 50", f"{nifty:,.0f}" if nifty else "N/A")
+                c4.metric("Nifty 50", f"{nifty:,.0f}" if nifty else "N/A")
 
                 if summary["positions"]:
-                    st.markdown("### Holdings")
                     pos_df = pd.DataFrame(summary["positions"])
-                    display = pos_df[[
-                        "ticker", "company_name", "shares", "buy_price",
-                        "current_price", "cost_basis", "current_value", "pnl", "pnl_pct"
-                    ]].rename(columns={
-                        "ticker": "Ticker", "company_name": "Company",
-                        "shares": "Shares", "buy_price": "Buy ₹",
-                        "current_price": "Curr ₹", "cost_basis": "Cost ₹",
-                        "current_value": "Value ₹", "pnl": "P&L ₹", "pnl_pct": "P&L %"
-                    })
-                    st.dataframe(display, use_container_width=True, hide_index=True)
+                    st.dataframe(pos_df[[c for c in [
+                        "ticker","company_name","shares","buy_price","current_price",
+                        "cost_basis","current_value","pnl","pnl_pct"
+                    ] if c in pos_df.columns]].rename(columns={
+                        "ticker":"Ticker","company_name":"Company","shares":"Shares",
+                        "buy_price":"Buy ₹","current_price":"Curr ₹","cost_basis":"Cost ₹",
+                        "current_value":"Value ₹","pnl":"P&L ₹","pnl_pct":"P&L %",
+                    }), use_container_width=True, hide_index=True)
 
-                    # Equity curve
-                    snapshots = get_daily_snapshots(sel)
-                    if len(snapshots) > 1:
-                        st.markdown("### Equity Curve")
-                        snap_df = pd.DataFrame(snapshots)
+                    snaps = get_daily_snapshots(sel)
+                    if len(snaps) > 1:
+                        snap_df = pd.DataFrame(snaps)
                         initial = strat["virtual_capital"]
                         snap_df["return_pct"] = (snap_df["portfolio_value"] - initial) / initial * 100
                         if snap_df["nifty_value"].notna().any():
-                            nifty_start = snap_df["nifty_value"].dropna().iloc[0]
-                            snap_df["nifty_return_pct"] = (snap_df["nifty_value"] - nifty_start) / nifty_start * 100
+                            ns = snap_df["nifty_value"].dropna().iloc[0]
+                            snap_df["nifty_return_pct"] = (snap_df["nifty_value"] - ns) / ns * 100
                         fig = go.Figure()
-                        fig.add_trace(go.Scatter(
-                            x=snap_df["snapshot_date"], y=snap_df["return_pct"],
-                            name="Portfolio Return %", line=dict(color="cyan", width=2)
-                        ))
+                        fig.add_trace(go.Scatter(x=snap_df["snapshot_date"],
+                            y=snap_df["return_pct"], name="Portfolio %",
+                            line=dict(color="cyan", width=2)))
                         if "nifty_return_pct" in snap_df.columns:
-                            fig.add_trace(go.Scatter(
-                                x=snap_df["snapshot_date"], y=snap_df["nifty_return_pct"],
-                                name="Nifty 50 Return %", line=dict(color="orange", width=2, dash="dash")
-                            ))
-                        fig.update_layout(
-                            title="Portfolio vs Nifty 50 (%)",
-                            yaxis_title="Return %", height=350,
-                            template="plotly_dark",
-                        )
+                            fig.add_trace(go.Scatter(x=snap_df["snapshot_date"],
+                                y=snap_df["nifty_return_pct"], name="Nifty 50 %",
+                                line=dict(color="orange", width=2, dash="dash")))
+                        fig.update_layout(title="Portfolio vs Nifty 50 (%)",
+                            yaxis_title="Return %", height=340, template="plotly_dark")
                         st.plotly_chart(fig, use_container_width=True)
-
-                    if st.button("Save Today's Snapshot"):
+                    if st.button("💾 Save Snapshot"):
                         save_daily_snapshot(sel, summary["total_value"], summary["cash_remaining"])
                         st.success("Snapshot saved")
                 else:
-                    st.info("No open positions in this strategy. Add stocks from 'Stock Deep Dive'.")
+                    st.info("No positions yet. Add from 💡 Suggestions.")
 
-    # ── Tab: Manage Trades ────────────────────────────────────────────────────
     with tab_trades:
-        strategies = get_all_strategies()
-        if not strategies:
-            st.info("No strategies yet.")
+        for s in get_all_strategies():
+            pass
+        strategies_all = get_all_strategies()
+        if strategies_all:
+            sel = st.selectbox("Strategy:", [s["id"] for s in strategies_all],
+                               format_func=lambda x: next(s["name"] for s in strategies_all if s["id"] == x),
+                               key="trades_strat")
+            for t in get_all_trades(sel):
+                status = "Open" if not t["sell_date"] else f"Closed @ ₹{t['sell_price']}"
+                ca, cb = st.columns([4, 1])
+                with ca:
+                    st.markdown(f"**{t['ticker']}** {t['company_name']} | "
+                                f"{t['shares']:.2f} @ ₹{t['buy_price']:.2f} | {status}")
+                with cb:
+                    if not t["sell_date"]:
+                        sp = st.number_input("Sell ₹", key=f"sell_{t['id']}", value=t["buy_price"])
+                        if st.button("Sell", key=f"do_sell_{t['id']}"):
+                            close_trade(t["id"], sp)
+                            st.rerun()
+
+    with tab_compare:
+        st.markdown("### Strategy Comparison")
+        comparison = compare_strategies()
+        if not comparison:
+            st.info("No strategy data yet.")
         else:
-            sel = st.selectbox(
-                "Select strategy:",
-                [s["id"] for s in strategies],
-                format_func=lambda x: next(s["name"] for s in strategies if s["id"] == x),
-                key="trades_strat"
-            )
-            all_trades = get_all_trades(sel)
-            if all_trades:
-                for t in all_trades:
-                    status = "Open" if not t["sell_date"] else f"Closed @ ₹{t['sell_price']}"
-                    col_a, col_b = st.columns([4, 1])
-                    with col_a:
-                        st.markdown(
-                            f"**{t['ticker']}** {t['company_name']} | "
-                            f"{t['shares']:.2f} shares @ ₹{t['buy_price']:.2f} | {status}"
-                        )
-                    with col_b:
-                        if not t["sell_date"]:
-                            sell_price = st.number_input("Sell ₹", key=f"sell_{t['id']}", value=t["buy_price"])
-                            if st.button("Sell", key=f"do_sell_{t['id']}"):
-                                close_trade(t["id"], sell_price)
-                                st.success("Trade closed")
-                                st.rerun()
-            else:
-                st.info("No trades in this strategy.")
+            df = pd.DataFrame(comparison)
+            st.dataframe(df[[c for c in [
+                "name","theme","status","virtual_capital","current_value",
+                "return_pct","nifty_return_pct","alpha_pct","created_at"
+            ] if c in df.columns]].rename(columns={
+                "name":"Strategy","theme":"Theme","status":"Status",
+                "virtual_capital":"Capital ₹","current_value":"Value ₹",
+                "return_pct":"Return %","nifty_return_pct":"Nifty %",
+                "alpha_pct":"Alpha %","created_at":"Created",
+            }), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 5: STRATEGY COMPARISON
+# PAGE 5: AUTO TRADER
 # ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Strategy Comparison":
-    import time as _time
-
-    st.title("Strategy Comparison")
-    st.caption("Compare all strategy versions by return and alpha vs Nifty 50")
-
-    col_ref, col_ts = st.columns([1, 3])
-    with col_ref:
-        manual_refresh = st.button("Refresh Live Prices", type="primary")
-
-    # Auto-refresh on first visit, then throttle to every 5 minutes
-    _now = _time.time()
-    _last_refresh = st.session_state.get("comparison_refreshed_at", 0)
-    _needs_refresh = manual_refresh or (_now - _last_refresh > 300)
-
-    if _needs_refresh:
-        with st.spinner("Fetching live prices for all active strategies..."):
-            update_all_snapshots()
-        st.session_state["comparison_refreshed_at"] = _time.time()
-        with col_ts:
-            st.caption(f"Updated just now")
-    else:
-        _secs = int(_now - _last_refresh)
-        with col_ts:
-            st.caption(f"Last updated {_secs}s ago — auto-refreshes every 5 min")
-
-    comparison = compare_strategies()
-    if not comparison:
-        st.info("No strategies with snapshot data yet. Run paper trading for a few days first.")
-        st.stop()
-
-    df = pd.DataFrame(comparison)
-    display = df[[
-        "name", "theme", "status", "virtual_capital",
-        "current_value", "return_pct", "nifty_return_pct", "alpha_pct", "created_at"
-    ]].rename(columns={
-        "name": "Strategy", "theme": "Theme", "status": "Status",
-        "virtual_capital": "Capital (₹)", "current_value": "Value (₹)",
-        "return_pct": "Return %", "nifty_return_pct": "Nifty %",
-        "alpha_pct": "Alpha %", "created_at": "Created"
-    })
-    display["Created"] = display["Created"].str[:10]
-    st.dataframe(display, use_container_width=True, hide_index=True)
-
-    # Bar chart: return comparison
-    if len(comparison) > 1:
-        fig = go.Figure()
-        fig.add_bar(
-            x=[r["name"] for r in comparison],
-            y=[r["return_pct"] for r in comparison],
-            name="Portfolio Return %", marker_color="cyan"
-        )
-        fig.add_bar(
-            x=[r["name"] for r in comparison],
-            y=[r["nifty_return_pct"] for r in comparison],
-            name="Nifty 50 Return %", marker_color="orange"
-        )
-        fig.update_layout(
-            barmode="group", title="Strategy Returns vs Nifty 50",
-            yaxis_title="Return %", template="plotly_dark", height=400
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Equity curves for all strategies
-        st.markdown("### Equity Curves — All Strategies")
-        fig2 = go.Figure()
-        for r in comparison:
-            snaps = get_daily_snapshots(r["id"])
-            if len(snaps) > 1:
-                snap_df = pd.DataFrame(snaps)
-                initial = r["virtual_capital"]
-                snap_df["return_pct"] = (snap_df["portfolio_value"] - initial) / initial * 100
-                fig2.add_trace(go.Scatter(
-                    x=snap_df["snapshot_date"], y=snap_df["return_pct"],
-                    name=r["name"], mode="lines"
-                ))
-        if fig2.data:
-            fig2.update_layout(
-                title="Portfolio Return % Over Time",
-                yaxis_title="Return %", template="plotly_dark", height=400
-            )
-            st.plotly_chart(fig2, use_container_width=True)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PAGE 7: AUTO TRADER
-# ═══════════════════════════════════════════════════════════════════════════════
-elif page == "Auto Trader":
-    st.title("Auto Trader")
+elif page == "⚙️ Auto Trader":
+    st.title("⚙️ Auto Trader")
     st.caption(
-        "Fully automatic portfolio: news → themes → screener → Claude buy/sell decisions. "
-        "Runs daily at 11:30 AM IST (weekdays) via Windows Task Scheduler. "
-        "Capital: ₹5,00,000 | Max positions: 5 | Stop-loss: −15%"
+        "Fully automated — Screen Nifty 500 → Sector-aware triage → LLM decisions. "
+        "Capital: ₹5,00,000 · Max 5 positions · Stop-loss: −15%"
     )
 
     trader = AutoTrader()
     trader.ensure_portfolio()
 
-    # ── Run Now ──────────────────────────────────────────────────────────────
-    col_run, col_last = st.columns([2, 3])
+    col_run, col_last = st.columns([2, 4])
     with col_run:
-        run_now = st.button("Run Pipeline Now", type="primary",
-                            help="Fetch news, extract themes, screen stocks, and execute trades")
+        run_now = st.button("▶ Run Pipeline Now", type="primary")
     with col_last:
-        last_run = trader.get_last_run()
-        if last_run and last_run.get("completed_at"):
-            st.caption(f"Last run: {last_run['completed_at'][:16]} — "
-                       f"{last_run['buys_made']} buys, {last_run['sells_made']} sells, "
-                       f"{last_run['stop_losses_triggered']} stop-losses")
+        last = trader.get_last_run()
+        if last and last.get("completed_at"):
+            st.caption(
+                f"Last run: {last['completed_at'][:16]} — "
+                f"{last['buys_made']} buys · {last['sells_made']} sells · "
+                f"{last['stop_losses_triggered']} stop-losses · "
+                f"{last.get('themes_found', 0)} POSITIVE triage results"
+            )
         else:
             st.caption("No completed runs yet.")
 
     if run_now:
-        with st.spinner("Running full pipeline (news → themes → screen → trade)... this takes 2–3 minutes"):
+        with st.spinner("Running: Screen → Triage → Decide… (~3–4 min)"):
             log = trader.run_pipeline()
         if log.get("errors"):
             st.error(f"Pipeline error: {log['errors'][0]}")
         else:
             parts = []
-            if log["buys"]:
-                parts.append(f"Bought: {', '.join(log['buys'])}")
-            if log["sells"]:
-                parts.append(f"Sold: {', '.join(log['sells'])}")
-            if log["stop_losses"]:
-                parts.append(f"Stop-loss: {', '.join(log['stop_losses'])}")
-            if not parts:
-                parts.append("No trades executed (held or no signals)")
-            st.success(" | ".join(parts))
-            if log["summary"]:
+            if log["buys"]:        parts.append(f"Bought: {', '.join(log['buys'])}")
+            if log["sells"]:       parts.append(f"Sold: {', '.join(log['sells'])}")
+            if log["stop_losses"]: parts.append(f"Stop-loss: {', '.join(log['stop_losses'])}")
+            if not parts:          parts.append("No trades (held or no signals)")
+            st.success(" · ".join(parts))
+            if log.get("summary"):
                 st.info(log["summary"])
         st.rerun()
 
     st.markdown("---")
-
-    # ── Portfolio Overview ────────────────────────────────────────────────────
     st.markdown("### Portfolio Overview")
-    with st.spinner("Fetching live prices..."):
+    with st.spinner("Fetching live prices…"):
         state = trader.get_portfolio_state()
-
     port = state["portfolio"]
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Capital", f"₹{port['capital']:,.0f}")
-    col2.metric("Portfolio Value", f"₹{state['total_value']:,.0f}",
-                f"{state['total_pnl_pct']:+.2f}%")
-    col3.metric("Cash Available", f"₹{state['cash_remaining']:,.0f}")
-    col4.metric("Open Positions", f"{len(state['positions'])}/5")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Capital",   f"₹{port['capital']:,.0f}")
+    c2.metric("Value",     f"₹{state['total_value']:,.0f}", f"{state['total_pnl_pct']:+.2f}%")
+    c3.metric("Cash",      f"₹{state['cash_remaining']:,.0f}")
+    c4.metric("Positions", f"{len(state['positions'])}/5")
     nifty = state.get("nifty_current")
-    col5.metric("Nifty 50", f"{nifty:,.0f}" if nifty else "N/A")
+    c5.metric("Nifty 50",  f"{nifty:,.0f}" if nifty else "N/A")
 
-    # ── Open Positions ────────────────────────────────────────────────────────
-    st.markdown("### Open Positions")
     if state["positions"]:
+        st.markdown("### Open Positions")
         pos_df = pd.DataFrame(state["positions"])
-        display_cols = {
-            "ticker": "Ticker",
-            "company_name": "Company",
-            "shares": "Shares",
-            "entry_price": "Entry ₹",
-            "current_price": "Current ₹",
-            "cost_basis": "Cost ₹",
-            "current_value": "Value ₹",
-            "pnl": "P&L ₹",
-            "pnl_pct": "P&L %",
-            "days_held": "Days Held",
-            "reason": "Buy Reason",
-        }
-        pos_display = pos_df[[c for c in display_cols if c in pos_df.columns]].rename(columns=display_cols)
-        st.dataframe(pos_display, use_container_width=True, hide_index=True)
-    else:
-        st.info("No open positions. Run the pipeline to start trading.")
+        st.dataframe(pos_df[[c for c in [
+            "ticker","company_name","shares","entry_price","current_price",
+            "cost_basis","current_value","pnl","pnl_pct","days_held","reason"
+        ] if c in pos_df.columns]].rename(columns={
+            "ticker":"Ticker","company_name":"Company","shares":"Shares",
+            "entry_price":"Entry ₹","current_price":"Curr ₹","cost_basis":"Cost ₹",
+            "current_value":"Value ₹","pnl":"P&L ₹","pnl_pct":"P&L %",
+            "days_held":"Days","reason":"Reason",
+        }), use_container_width=True, hide_index=True)
 
-    # ── Last Run Summary ──────────────────────────────────────────────────────
-    last_run = trader.get_last_run()
-    if last_run and last_run.get("llm_summary") and not last_run["llm_summary"].startswith("ERROR"):
-        st.markdown("### Last Run — Claude's Rationale")
-        st.markdown(f"> {last_run['llm_summary']}")
+    last = trader.get_last_run()
+    if last and last.get("llm_summary") and not str(last["llm_summary"]).startswith("ERROR"):
+        st.markdown("### Last Run — LLM Rationale")
+        st.info(last["llm_summary"])
+
+    th = trader.get_trade_history()
+    if th:
+        st.markdown("### Trade History")
+        th_df = pd.DataFrame(th)
+        cols_th = [c for c in [
+            "trade_date","ticker","company_name","action","shares",
+            "price","total_value","reason",
+        ] if c in th_df.columns]
+        filter_col1, filter_col2 = st.columns([2, 1])
+        with filter_col1:
+            tickers_in_history = sorted(th_df["ticker"].unique().tolist()) if "ticker" in th_df.columns else []
+            selected_tickers = st.multiselect(
+                "Filter by ticker", tickers_in_history,
+                placeholder="All tickers"
+            )
+        with filter_col2:
+            action_filter = st.selectbox("Action", ["All", "BUY", "SELL"])
+        if selected_tickers:
+            th_df = th_df[th_df["ticker"].isin(selected_tickers)]
+        if action_filter != "All" and "action" in th_df.columns:
+            th_df = th_df[th_df["action"] == action_filter]
+
+        st.dataframe(th_df[cols_th].rename(columns={
+            "trade_date": "Date", "ticker": "Ticker", "company_name": "Company",
+            "action": "Action", "shares": "Shares", "price": "Price ₹",
+            "total_value": "Value ₹", "reason": "Reason",
+        }), use_container_width=True, hide_index=True)
+
+        # Equity curve
+        if "trade_date" in th_df.columns and "total_value" in th_df.columns:
+            st.markdown("### Equity Curve")
+            th_df_sorted = th_df.sort_values("trade_date")
+            th_df_sorted["cumulative"] = th_df_sorted.apply(
+                lambda row: row["total_value"] if row.get("action") == "BUY" else -row["total_value"],
+                axis=1,
+            ).cumsum() + port["capital"]
+            st.line_chart(th_df_sorted.set_index("trade_date")["cumulative"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE 6 — News Feed
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "📡 News Feed":
+    st.markdown("## 📡 News Feed")
+    st.markdown("Raw news from your database — search, filter, and explore what's moving the market.")
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    nf_col1, nf_col2, nf_col3 = st.columns([3, 2, 1])
+    with nf_col1:
+        news_query = st.text_input("🔍 Search keywords", placeholder="repo rate, FDA, EV, USD…")
+    with nf_col2:
+        sector_opts = [
+            "All Sectors",
+            "FINANCIAL SERVICES", "INFORMATION TECHNOLOGY", "HEALTHCARE",
+            "AUTOMOBILE AND AUTO COMPONENTS", "CAPITAL GOODS", "CONSTRUCTION",
+            "CHEMICALS", "CONSUMER DURABLES", "FAST MOVING CONSUMER GOODS",
+            "OIL GAS & CONSUMABLE FUELS", "POWER", "METALS & MINING",
+            "TELECOMMUNICATION", "REALTY", "TEXTILES",
+            "MEDIA ENTERTAINMENT & PUBLICATION",
+        ]
+        news_sector = st.selectbox("Sector filter", sector_opts)
+    with nf_col3:
+        news_hours = st.selectbox("Time window", [6, 12, 24, 48, 72], index=2)
+        news_hours = int(news_hours)
 
     st.markdown("---")
 
-    # ── Trade History ─────────────────────────────────────────────────────────
-    st.markdown("### Trade History")
-    trade_history = trader.get_trade_history()
-    if trade_history:
-        th_df = pd.DataFrame(trade_history)
+    # ── Fetch news from DB ────────────────────────────────────────────────────
+    try:
+        from modules.db import get_conn
+        from datetime import datetime, timedelta
 
-        # Filter by action type
-        action_filter = st.multiselect(
-            "Filter by action:",
-            options=["buy", "sell", "stop_loss"],
-            default=["buy", "sell", "stop_loss"],
-            key="trade_action_filter",
-        )
-        if action_filter:
-            th_df = th_df[th_df["action"].isin(action_filter)]
+        conn = get_conn()
+        cur  = conn.cursor()
 
-        display_th = {
-            "trade_date": "Date",
-            "action": "Action",
-            "ticker": "Ticker",
-            "shares": "Shares",
-            "price": "Price ₹",
-            "reason": "Reason",
-        }
-        th_display = th_df[[c for c in display_th if c in th_df.columns]].rename(columns=display_th)
+        since_dt = (datetime.utcnow() - timedelta(hours=news_hours)).isoformat()
 
-        # Color-code action column
-        def _action_color(val):
-            colors = {"buy": "color: #22c55e", "sell": "color: #f97316", "stop_loss": "color: #ef4444"}
-            return colors.get(val, "")
+        base_sql  = "SELECT * FROM news_articles WHERE published_at >= %s"
+        params    = [since_dt]
 
-        styled = th_display.style.applymap(_action_color, subset=["Action"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
-    else:
-        st.info("No trades yet.")
+        if news_query.strip():
+            keywords = [k.strip() for k in news_query.replace(",", " ").split() if k.strip()]
+            if keywords:
+                kw_clause = " OR ".join(["(title ILIKE %s OR summary ILIKE %s)" for _ in keywords])
+                base_sql += f" AND ({kw_clause})"
+                for kw in keywords:
+                    params.extend([f"%{kw}%", f"%{kw}%"])
 
-    # ── Equity Curve ──────────────────────────────────────────────────────────
-    equity_history = trader.get_equity_history()
-    if len(equity_history) > 1:
-        st.markdown("### Equity Curve")
-        eq_df = pd.DataFrame(equity_history)
-        capital = port["capital"]
-        eq_df["return_pct"] = (eq_df["portfolio_value"] - capital) / capital * 100
+        if news_sector != "All Sectors":
+            from modules.news_triage import SECTOR_SIGNALS
+            sector_kws = SECTOR_SIGNALS.get(news_sector, {}).get("keywords", [])
+            if sector_kws:
+                sk_clause = " OR ".join(["(title ILIKE %s OR summary ILIKE %s)" for _ in sector_kws])
+                base_sql += f" AND ({sk_clause})"
+                for sk in sector_kws:
+                    params.extend([f"%{sk}%", f"%{sk}%"])
 
-        # Nifty benchmark from run dates
-        nifty_data = None
+        base_sql += " ORDER BY published_at DESC LIMIT 200"
+        rows = cur.execute(base_sql, params).fetchall()
+        conn.close()
+
+        if rows:
+            news_list = [dict(r) for r in rows]
+            st.markdown(f"**{len(news_list)} articles** found in last **{news_hours}h**")
+
+            # ── Summary pills ────────────────────────────────────────────────
+            sentiment_counts = {"POSITIVE": 0, "NEUTRAL": 0, "NEGATIVE": 0}
+            for item in news_list:
+                s = (item.get("sentiment") or "NEUTRAL").upper()
+                if s in sentiment_counts:
+                    sentiment_counts[s] += 1
+                else:
+                    sentiment_counts["NEUTRAL"] += 1
+
+            pill_c1, pill_c2, pill_c3, pill_c4 = st.columns(4)
+            pill_c1.metric("Total",    len(news_list))
+            pill_c2.metric("🟢 Positive", sentiment_counts["POSITIVE"])
+            pill_c3.metric("🟡 Neutral",  sentiment_counts["NEUTRAL"])
+            pill_c4.metric("🔴 Negative", sentiment_counts["NEGATIVE"])
+
+            st.markdown("---")
+
+            # ── Article cards ────────────────────────────────────────────────
+            for item in news_list[:50]:
+                pub  = item.get("published_at", "")[:16].replace("T", " ")
+                sent = (item.get("sentiment") or "").upper()
+                badge = {"POSITIVE": "🟢", "NEGATIVE": "🔴"}.get(sent, "🟡")
+                src   = item.get("source") or item.get("feed_name") or ""
+                title = item.get("title") or "(no title)"
+                url   = item.get("url") or item.get("link") or ""
+                summary = item.get("summary") or ""
+
+                with st.expander(f"{badge} {title}  —  {pub}  [{src}]"):
+                    if summary:
+                        st.markdown(summary[:600] + ("…" if len(summary) > 600 else ""))
+                    if url:
+                        st.markdown(f"[Read full article ↗]({url})")
+                    tickers_mentioned = item.get("tickers_mentioned") or ""
+                    if tickers_mentioned:
+                        st.caption(f"Tickers mentioned: {tickers_mentioned}")
+
+            if len(news_list) > 50:
+                st.info(f"Showing top 50 of {len(news_list)} articles. Refine your search to narrow results.")
+        else:
+            st.info(f"No articles found in the last {news_hours}h with the current filters. "
+                    "Try expanding the time window or clearing keyword filters.")
+
+    except Exception as e:
+        st.error(f"Could not load news feed: {e}")
+        st.caption("Make sure your database is connected and the news_articles table exists. "
+                   "Run the Auto Trader pipeline once to populate it.")
+
+    # ── Manual refresh button ─────────────────────────────────────────────────
+    st.markdown("---")
+    nf_btn_col1, nf_btn_col2 = st.columns([1, 3])
+    with nf_btn_col1:
+        if st.button("🔄 Refresh News DB", use_container_width=True):
+            with st.spinner("Fetching latest news from all feeds…"):
+                try:
+                    from modules.news_fetcher import refresh_news_db
+                    count = refresh_news_db()
+                    st.success(f"Fetched {count} new articles.")
+                except Exception as e:
+                    st.warning(f"News refresh failed: {e}")
+    with nf_btn_col2:
+        st.caption("News is automatically refreshed when you run the Auto Trader pipeline. "
+                   "Use this button to pull the latest articles manually.")
+
+    # ── Sector heatmap ────────────────────────────────────────────────────────
+    with st.expander("📊 Sector News Volume (last 24h)", expanded=False):
         try:
-            import yfinance as yf
-            dates = eq_df["run_date"].tolist()
-            nifty_hist = yf.download("^NSEI", start=dates[0], end=dates[-1], progress=False)
-            if not nifty_hist.empty:
-                nifty_hist = nifty_hist["Close"].reset_index()
-                nifty_hist.columns = ["Date", "nifty"]
-                nifty_hist["Date"] = nifty_hist["Date"].astype(str).str[:10]
-                nifty_start = nifty_hist["nifty"].iloc[0]
-                nifty_hist["nifty_return_pct"] = (nifty_hist["nifty"] - nifty_start) / nifty_start * 100
-                nifty_data = nifty_hist
-        except Exception:
-            pass
+            from modules.news_triage import SECTOR_SIGNALS
+            from modules.db import get_conn as _gc
+            from datetime import datetime as _dt, timedelta as _td
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=eq_df["run_date"], y=eq_df["return_pct"],
-            name="Auto Portfolio %", line=dict(color="cyan", width=2),
-        ))
-        if nifty_data is not None:
-            fig.add_trace(go.Scatter(
-                x=nifty_data["Date"], y=nifty_data["nifty_return_pct"],
-                name="Nifty 50 %", line=dict(color="orange", width=2, dash="dash"),
-            ))
-        fig.update_layout(
-            title="Auto Portfolio vs Nifty 50 (Return %)",
-            yaxis_title="Return %", height=350, template="plotly_dark",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            _conn  = _gc()
+            _cur   = _conn.cursor()
+            _since = (_dt.utcnow() - _td(hours=24)).isoformat()
+            _rows  = _cur.execute(
+                "SELECT title, summary FROM news_articles WHERE published_at >= %s", (_since,)
+            ).fetchall()
+            _conn.close()
+
+            if _rows:
+                sector_hits = {}
+                all_text = " ".join(
+                    f"{r['title']} {r.get('summary','')}" for r in _rows
+                ).lower()
+                for sector, sig in SECTOR_SIGNALS.items():
+                    hits = sum(all_text.count(kw.lower()) for kw in sig["keywords"])
+                    if hits > 0:
+                        sector_hits[sector] = hits
+
+                if sector_hits:
+                    heat_df = pd.DataFrame(
+                        sorted(sector_hits.items(), key=lambda x: x[1], reverse=True),
+                        columns=["Sector", "Keyword Hits"]
+                    )
+                    st.bar_chart(heat_df.set_index("Sector")["Keyword Hits"])
+                else:
+                    st.info("No sector keyword hits in recent news.")
+            else:
+                st.info("No articles in the last 24h to analyse.")
+        except Exception as _e:
+            st.caption(f"Heatmap unavailable: {_e}")

@@ -2,6 +2,16 @@
 Automatic paper trader — runs the full pipeline end-to-end and makes
 LLM-driven buy/sell decisions without human intervention.
 
+Pipeline (new screen-first approach):
+  OLD: news → extract themes → screen stocks matching themes → decide
+  NEW: screen Nifty 500 fundamentally → triage top picks with sector-aware news → decide
+
+Why the change:
+  - Free RSS feeds are too noisy and lagging to drive reliable theme extraction
+  - screen-first gives a stable, objective candidate list every day
+  - Triage asks sector-specific questions per stock (repo rate for banks,
+    FDA actions for pharma, etc.) — much higher signal quality than broad themes
+
 Capital: ₹5,00,000  |  Max positions: 5  |  Stop-loss: -15%
 """
 import json
@@ -10,8 +20,8 @@ import yfinance as yf
 from datetime import date
 from modules.db import get_conn
 from modules.news_fetcher import fetch_all_feeds
-from modules.theme_engine import extract_themes
-from modules.screener import screen_stocks_for_theme
+from modules.screener import screen_nifty500
+from modules.news_triage import triage_batch, format_for_llm
 from modules.llm_client import call_llm, _strip_fences
 
 CAPITAL = 500_000        # ₹5,00,000 paper capital
@@ -156,12 +166,12 @@ class AutoTrader:
 
     def run_pipeline(self) -> dict:
         """
-        Execute the full auto-trading pipeline:
-          1. Fetch news
-          2. Extract themes (Claude Haiku)
-          3. Screen stocks for top 2 themes
-          4. Apply hard stop-losses
-          5. Ask Claude Sonnet for buy/sell decisions
+        Execute the full auto-trading pipeline (screen-first approach):
+          1. Refresh news DB (background — used by triage, not for theme extraction)
+          2. Screen Nifty 500 fundamentally → top 25 quality candidates
+          3. Apply hard stop-losses on existing positions
+          4. Run sector-aware news triage on top candidates
+          5. Ask LLM for buy/sell decisions (with triage context baked in)
           6. Execute trades
           7. Save run log
         Returns summary dict with buys/sells/stop_losses/errors lists.
@@ -182,45 +192,25 @@ class AutoTrader:
         conn.close()
 
         try:
-            # ── 1. Fetch news ─────────────────────────────────────────────────
-            print("[AutoTrader] Fetching news...")
+            # ── 1. Refresh news DB ────────────────────────────────────────────
+            # News is no longer the pipeline driver — but we still refresh it
+            # so the triage module can search it for sector-signal keywords.
+            print("[AutoTrader] Refreshing news DB for triage signals...")
             n_articles = fetch_all_feeds()
-            print(f"  {n_articles} new articles fetched")
+            print(f"  {n_articles} new articles cached")
 
-            # ── 2. Extract themes ─────────────────────────────────────────────
-            print("[AutoTrader] Extracting themes...")
-            themes = extract_themes(force_refresh=True, provider="gemini")
-            if not themes:
-                raise RuntimeError("No themes extracted — news feeds may be empty")
-            print(f"  {len(themes)} themes found")
+            # ── 2. Screen Nifty 500 fundamentally ────────────────────────────
+            print("[AutoTrader] Screening Nifty 500 on fundamentals...")
+            candidates = screen_nifty500(
+                sectors=None,      # all sectors — no theme bias
+                max_results=25,    # top 25 quality stocks by market cap
+                force=True,        # always fresh on auto-trader run
+            )
+            if not candidates:
+                raise RuntimeError("Screener returned no candidates — check yfinance connectivity")
+            print(f"  {len(candidates)} stocks passed fundamental filters")
 
-            # ── 3. Screen top 2 themes ────────────────────────────────────────
-            print("[AutoTrader] Screening stocks for top themes...")
-            all_candidates: list[dict] = []
-            top_themes = sorted(themes, key=lambda t: t["confidence"], reverse=True)[:2]
-
-            for theme in top_themes:
-                stocks = screen_stocks_for_theme(
-                    theme_id=theme["id"],
-                    theme_name=theme["theme"],
-                    sectors=theme["sectors"],
-                    force=True,
-                    max_stocks=20,
-                )
-                for s in stocks:
-                    s["theme"] = theme["theme"]
-                all_candidates.extend(stocks)
-                print(f"  '{theme['theme']}': {len(stocks)} stocks")
-
-            # Deduplicate by ticker (keep first/highest-confidence theme)
-            seen: set[str] = set()
-            unique_candidates: list[dict] = []
-            for s in all_candidates:
-                if s["ticker"] not in seen:
-                    seen.add(s["ticker"])
-                    unique_candidates.append(s)
-
-            # ── 4. Hard stop-losses ───────────────────────────────────────────
+            # ── 3. Hard stop-losses ───────────────────────────────────────────
             print("[AutoTrader] Checking stop-losses...")
             state = self.get_portfolio_state()
             stop_loss_tickers: set[str] = set()
@@ -239,10 +229,22 @@ class AutoTrader:
             # Refresh state after stop-losses
             state = self.get_portfolio_state()
 
+            # ── 4. Sector-aware news triage ───────────────────────────────────
+            # Only triage stocks we don't already hold (no point triaging held positions)
+            held_tickers = {p["ticker"] for p in state["positions"]}
+            to_triage    = [s for s in candidates if s["ticker"] not in held_tickers]
+            already_held = [s for s in candidates if s["ticker"] in held_tickers]
+
+            print(f"[AutoTrader] Running sector-aware triage on {len(to_triage)} new candidates...")
+            triaged = triage_batch(to_triage, provider="gemini", top_n=15)
+
+            # Combine: triaged candidates + existing held positions (for sell decisions)
+            all_candidates = triaged + already_held
+
             # ── 5. LLM decisions ──────────────────────────────────────────────
-            print("[AutoTrader] Asking Claude for buy/sell decisions...")
+            print("[AutoTrader] Asking LLM for buy/sell decisions...")
             open_positions = [p for p in state["positions"] if p["ticker"] not in stop_loss_tickers]
-            decisions = self._make_decisions(unique_candidates, open_positions, state["cash_remaining"])
+            decisions = self._make_decisions(all_candidates, open_positions, state["cash_remaining"])
             log["summary"] = decisions.get("summary", "")
 
             # ── 6a. Sells ─────────────────────────────────────────────────────
@@ -316,6 +318,7 @@ class AutoTrader:
 
             # ── 7. Save run log ───────────────────────────────────────────────
             final_state = self.get_portfolio_state()
+            n_positive = sum(1 for s in triaged if s.get("triage_sentiment") == "POSITIVE")
             conn = get_conn()
             c = conn.cursor()
             c.execute("""
@@ -330,7 +333,8 @@ class AutoTrader:
                     completed_at = %s
                 WHERE id = %s
             """, (
-                len(themes), len(unique_candidates),
+                n_positive,          # repurpose themes_found = # POSITIVE triage results
+                len(candidates),
                 len(log["buys"]), len(log["sells"]), len(log["stop_losses"]),
                 final_state["total_value"], log["summary"],
                 __import__('datetime').datetime.now().isoformat(), run_id,
@@ -366,7 +370,13 @@ class AutoTrader:
         positions: list[dict],
         cash: float,
     ) -> dict:
-        """Call Claude Sonnet to decide which stocks to buy, sell, or hold."""
+        """
+        Ask the LLM to make buy/sell decisions.
+
+        Candidates now include triage fields (triage_sentiment, triage_catalyst,
+        triage_risk, triage_summary) so the LLM gets sector-specific news context
+        per stock — not just fundamentals.
+        """
         pos_lines = []
         for p in positions:
             pos_lines.append(
@@ -376,15 +386,19 @@ class AutoTrader:
             )
         pos_text = "\n".join(pos_lines) if pos_lines else "  (no open positions)"
 
-        # Top 12 candidates by market cap for the prompt
-        top_candidates = sorted(candidates, key=lambda x: x.get("market_cap_cr", 0), reverse=True)[:12]
+        # Sort candidates: POSITIVE triage first, then by market cap
+        sentiment_order = {"POSITIVE": 0, "NEUTRAL": 1, "NEGATIVE": 2}
+        top_candidates = sorted(
+            candidates,
+            key=lambda x: (
+                sentiment_order.get(x.get("triage_sentiment", "NEUTRAL"), 1),
+                -x.get("market_cap_cr", 0),
+            )
+        )[:12]
+
         cand_lines = []
         for s in top_candidates:
-            cand_lines.append(
-                f"  {s['ticker']} | {s['company_name'][:25]} | {s.get('theme','')[:30]} | "
-                f"P/E {s.get('pe') or 'N/A'} | ROE {s.get('roe') or 'N/A'}% | "
-                f"RevGrowth {s.get('revenue_growth') or 'N/A'}% | MCap ₹{s.get('market_cap_cr',0):.0f}Cr"
-            )
+            cand_lines.append(format_for_llm(s))
         cand_text = "\n".join(cand_lines) if cand_lines else "  (no candidates found)"
 
         open_slots = MAX_POSITIONS - len(positions)
@@ -396,22 +410,30 @@ Open positions: {len(positions)}/{MAX_POSITIONS} (can add {open_slots} more)
 CURRENT HOLDINGS:
 {pos_text}
 
-TODAY'S SCREENER RESULTS (top candidates by market cap):
+TODAY'S SCREENED + TRIAGED CANDIDATES:
+(Format: ticker | sector | fundamentals | [NEWS SENTIMENT confidence%] triage summary | Catalyst | Risk)
 {cand_text}
+
+HOW TO READ THE TRIAGE:
+- POSITIVE = recent sector-specific news is a tailwind for this stock
+- NEUTRAL  = no strong signal either way
+- NEGATIVE = sector-specific news is a headwind (e.g. RBI hawkish for banks, FDA warning for pharma)
+- Confidence reflects how much relevant news was available (low = limited data)
 
 DECISION RULES:
 - Long-term focus (6–18 months): do NOT sell just because a stock is down short-term
-- Sell only if: clearly no longer aligns with any theme AND held > 30 days, OR fundamentals significantly deteriorated
+- Prefer POSITIVE triage + strong fundamentals (ROE, revenue growth, reasonable P/E)
+- Avoid buying stocks with NEGATIVE triage unless fundamentals are exceptionally strong
+- Sell only if: triage is NEGATIVE with high confidence AND held > 30 days, OR fundamentals significantly deteriorated
 - Buy only if open_slots > 0 and cash >= ₹{MIN_BUY_CASH:,.0f}
-- Do NOT recommend buying stocks already in holdings
-- Prefer large-cap, quality stocks (high ROE, revenue growth, manageable P/E)
+- Do NOT buy stocks already in holdings
 
 Return ONLY valid JSON (no markdown fences):
 {{
-  "sells": [{{"ticker": "X.NS", "reason": "brief specific reason"}}],
-  "buys": [{{"ticker": "X.NS", "reason": "brief specific reason"}}],
-  "holds": [{{"ticker": "X.NS", "reason": "brief specific reason"}}],
-  "summary": "2–3 sentence portfolio rationale"
+  "sells": [{{"ticker": "X.NS", "reason": "specific reason referencing news + fundamentals"}}],
+  "buys":  [{{"ticker": "X.NS", "reason": "specific reason referencing news + fundamentals"}}],
+  "holds": [{{"ticker": "X.NS", "reason": "brief reason"}}],
+  "summary": "2–3 sentence portfolio rationale mentioning key sector signals driving decisions"
 }}"""
 
         try:
@@ -447,6 +469,7 @@ Return ONLY valid JSON (no markdown fences):
             (portfolio_id, ticker, company_name, shares, entry_price, entry_date, reason, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, 'open')
         """, (self.portfolio_id, ticker, company_name, shares, price, date.today().isoformat(), reason))
+
 
         c.execute("""
             INSERT INTO auto_trades

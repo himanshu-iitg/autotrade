@@ -1,4 +1,16 @@
-"""Screen NSE stocks by sector + quality fundamentals using yfinance."""
+"""Screen NSE stocks by sector + quality fundamentals using yfinance.
+
+Key design decisions:
+  - Nifty 500 industry pre-filter is the ONLY sector gate. The secondary
+    yfinance sector check was a false-negative trap (US taxonomy vs NSE labels)
+    and has been removed as a hard filter.
+  - EPS filter is now soft: a stock passes if EPS > 0, OR if ROE > 10% and
+    revenue growth > 5% (quality growth companies often have temporarily
+    depressed EPS from exceptional items / capex cycles).
+  - max_results controls the final output count directly (no more split between
+    max_stocks param and SCREENER_DEFAULTS["max_stocks_per_theme"]).
+  - New screen_nifty500() entry point for screen-first (no theme required).
+"""
 import time
 import pandas as pd
 import yfinance as yf
@@ -92,172 +104,298 @@ def _nifty500_industry_match(nse_industry: str, sectors: list[str]) -> bool:
     return False
 
 
-def screen_stocks_for_theme(
-    theme_id: int,
-    theme_name: str,
-    sectors: list[str],
+def _passes_quality_filters(info: dict, cfg: dict) -> tuple[bool, str]:
+    """
+    Apply fundamental quality filters. Returns (passes: bool, reason: str).
+
+    EPS rule (soft): pass if EPS > 0, OR if the company shows quality
+    signals (ROE > 10% and revenue growth > 5%) — catches great companies
+    with temporarily depressed earnings (infra capex cycles, provisioning hits,
+    exceptional write-offs, etc.).
+    """
+    market_cap    = info.get("market_cap") or 0
+    market_cap_cr = market_cap / 1e7
+    pe            = info.get("pe")
+    debt_eq       = info.get("debt_equity")   # yfinance returns this as %, e.g. 150 = 1.5x
+    eps           = info.get("eps_ttm")
+    roe           = info.get("roe") or 0       # decimal, e.g. 0.15 = 15%
+    rev_growth    = info.get("revenue_growth") or 0  # decimal, e.g. 0.12 = 12%
+    price         = info.get("current_price")
+
+    if market_cap_cr < cfg["min_market_cap_cr"]:
+        return False, f"market_cap ₹{market_cap_cr:.0f}Cr < min {cfg['min_market_cap_cr']}"
+
+    if not price or price <= 0:
+        return False, "no price data"
+
+    if pe is not None and pe <= cfg.get("min_pe", 0):
+        return False, f"P/E {pe:.1f} <= min {cfg.get('min_pe', 0)}"
+
+    if pe is not None and pe > cfg["max_pe"]:
+        return False, f"P/E {pe:.1f} > max {cfg['max_pe']}"
+
+    if debt_eq is not None and debt_eq > cfg["max_debt_equity"] * 100:
+        return False, f"D/E {debt_eq/100:.1f}x > max {cfg['max_debt_equity']}x"
+
+    # ── Soft EPS filter ────────────────────────────────────────────────────────
+    # Block only if: EPS negative AND neither ROE nor revenue growth compensates
+    if eps is not None and eps <= 0:
+        quality_compensates = (roe * 100 > 10) or (rev_growth * 100 > 5)
+        if not quality_compensates:
+            return False, f"EPS {eps:.2f} <= 0 with no quality offset (ROE={roe*100:.1f}%, RevGrowth={rev_growth*100:.1f}%)"
+
+    # ── Optional growth floor ──────────────────────────────────────────────────
+    min_rev_growth = cfg.get("min_revenue_growth_pct")   # e.g. -5 (allow slight declines)
+    min_roe        = cfg.get("min_roe_pct")               # e.g. 8
+    if min_rev_growth is not None and rev_growth * 100 < min_rev_growth:
+        return False, f"revenue growth {rev_growth*100:.1f}% < min {min_rev_growth}%"
+    if min_roe is not None and roe * 100 < min_roe:
+        return False, f"ROE {roe*100:.1f}% < min {min_roe}%"
+
+    return True, "ok"
+
+
+def _build_result(ticker: str, info: dict) -> dict:
+    """Build a clean result dict from raw yfinance info."""
+    pe      = info.get("pe")
+    debt_eq = info.get("debt_equity") or 0
+    price   = info.get("current_price")
+    return {
+        "ticker":         ticker,
+        "company_name":   info.get("company_name", ""),
+        "sector":         info.get("sector", ""),
+        "industry":       info.get("industry", ""),
+        "market_cap_cr":  round((info.get("market_cap") or 0) / 1e7, 2),
+        "pe":             round(pe, 2) if pe else None,
+        "pb":             round(info.get("pb") or 0, 2),
+        "roe":            round((info.get("roe") or 0) * 100, 2),
+        "debt_equity":    round(debt_eq / 100, 2),
+        "revenue_growth": round((info.get("revenue_growth") or 0) * 100, 2),
+        "eps_growth":     round((info.get("earnings_growth") or 0) * 100, 2),
+        "eps_ttm":        info.get("eps_ttm"),
+        "current_price":  round(price, 2) if price else None,
+    }
+
+
+def get_recently_seen_tickers(days_back: int = 3) -> set[str]:
+    """Return tickers that appeared in any screen in the last N days (excluding today)."""
+    try:
+        from datetime import date, timedelta
+        conn  = get_conn()
+        c     = conn.cursor()
+        since = (date.today() - timedelta(days=days_back)).isoformat()
+        today = date.today().isoformat()
+        rows  = c.execute(
+            "SELECT DISTINCT ticker FROM screened_stocks WHERE session_date >= %s AND session_date < %s",
+            (since, today),
+        ).fetchall()
+        conn.close()
+        return {r["ticker"] for r in rows}
+    except Exception:
+        return set()
+
+
+def screen_nifty500(
+    sectors: list[str] | None = None,
     filters: dict | None = None,
-    max_stocks: int = 30,
+    max_results: int = 30,
+    cache_key: str = "all",
     force: bool = False,
+    shuffle: bool = False,
+    exclude_tickers: set[str] | None = None,
 ) -> list[dict]:
     """
-    Screen Nifty 500 stocks matching given sectors + quality filters.
-    Uses Nifty 500 constituent list with industry pre-filtering for relevant coverage.
-    force=True clears today's cache before screening.
+    Screen-first entry point — no theme required.
+
+    Screens the full Nifty 500 (or a sector-filtered subset) purely on
+    fundamental quality. Call this first, then run news_triage on the results.
+
+    sectors : NSE sector list to pre-filter by, or None for all 500
+    max_results : final number of stocks to return (sorted by market cap)
+    cache_key : used to namespace the DB cache (e.g. "all", "banking", "auto")
     """
     today = date.today().isoformat()
-    cfg = {**SCREENER_DEFAULTS, **(filters or {})}
+    cfg   = {**SCREENER_DEFAULTS, **(filters or {})}
 
     conn = get_conn()
-    c = conn.cursor()
+    c    = conn.cursor()
 
-    # Clear cache if forced
+    # Theme-agnostic cache: use theme_id = -1 and store cache_key in company_name prefix
+    cache_theme_id = -1
     if force:
         c.execute(
             "DELETE FROM screened_stocks WHERE session_date = %s AND theme_id = %s",
-            (today, theme_id)
+            (today, cache_theme_id),
         )
         conn.commit()
 
-    # Check DB cache (avoids repeat yfinance calls for same theme today)
     cached = c.execute(
-        "SELECT * FROM screened_stocks WHERE session_date = %s AND theme_id = %s",
-        (today, theme_id)
+        "SELECT * FROM screened_stocks WHERE session_date = %s AND theme_id = %s ORDER BY market_cap_cr DESC",
+        (today, cache_theme_id),
     ).fetchall()
     if cached:
         conn.close()
         return [dict(r) for r in cached]
 
-    # ── Build ticker universe ─────────────────────────────────────────────────
-    # Prefer Nifty 500 with industry pre-filtering (quality stocks + relevant sectors)
-    nifty500_df = load_nifty500_stocks()
+    conn.close()
 
-    if not nifty500_df.empty and "INDUSTRY" in nifty500_df.columns:
-        # Pre-filter by Nifty 500 industry column — avoids wasting yfinance calls
-        mask = nifty500_df["INDUSTRY"].fillna("").apply(
+    # Build universe
+    nifty500_df = load_nifty500_stocks()
+    if nifty500_df.empty:
+        nse_df  = load_nse_stocks()
+        tickers = nse_df["YF_TICKER"].dropna().tolist()
+        print(f"  Nifty 500 unavailable; using full NSE list ({len(tickers)} stocks)")
+    elif sectors and "INDUSTRY" in nifty500_df.columns:
+        mask    = nifty500_df["INDUSTRY"].fillna("").apply(
             lambda ind: _nifty500_industry_match(ind, sectors)
         )
-        pre_filtered = nifty500_df[mask]
-
-        if not pre_filtered.empty:
-            tickers = pre_filtered["YF_TICKER"].dropna().tolist()
-            print(f"  Nifty 500 pre-filter: {len(tickers)} stocks match sectors {sectors}")
-        else:
-            # No industry match — screen all Nifty 500 (shuffled for variety)
-            tickers = nifty500_df["YF_TICKER"].dropna().sample(frac=1, random_state=42).tolist()
-            print(f"  No Nifty 500 industry match; using full 500 (shuffled)")
+        filtered_df = nifty500_df[mask]
+        tickers = filtered_df["YF_TICKER"].dropna().tolist() if not filtered_df.empty \
+                  else nifty500_df["YF_TICKER"].dropna().tolist()
+        print(f"  Nifty 500 sector pre-filter: {len(tickers)} stocks")
     else:
-        # Fallback: full NSE list (sorted alphabetically — less ideal)
-        nse_df = load_nse_stocks()
-        tickers = nse_df["YF_TICKER"].dropna().tolist()
-        print(f"  Nifty 500 unavailable; using NSE full list ({len(tickers)} stocks)")
+        tickers = nifty500_df["YF_TICKER"].dropna().tolist()
+        print(f"  Screening full Nifty 500 ({len(tickers)} stocks)")
 
-    # Cap batch size: check up to 4× target stocks to have enough after filtering
-    batch = tickers[:max_stocks * 4]
-    print(f"  Fetching fundamentals for {len(batch)} tickers (may take ~{len(batch) * 0.2:.0f}s)...")
+    # Discovery mode: shuffle so different stocks surface each run
+    if shuffle:
+        import random
+        random.shuffle(tickers)
+
+    # Exclude recently seen tickers if requested
+    if exclude_tickers:
+        before = len(tickers)
+        tickers = [t for t in tickers if t not in exclude_tickers]
+        print(f"  Excluded {before - len(tickers)} recently seen tickers")
+
+    # Fetch in batches of max_results * 4 to have enough candidates after filtering
+    batch = tickers[: max_results * 4]
+    print(f"  Fetching fundamentals for {len(batch)} tickers (~{len(batch) * 0.2:.0f}s)...")
     fundamentals = get_fundamentals_batch(batch, pause=0.2)
 
-    # ── Apply quality filters ─────────────────────────────────────────────────
     results = []
     for ticker, info in fundamentals.items():
         if not info:
             continue
-
-        yf_sector = (info.get("sector") or "").lower()
-        yf_industry = (info.get("industry") or "").lower()
-
-        # Sector match via yfinance sector/industry (secondary confirmation)
-        sector_keywords = [s.lower() for s in sectors]
-        sector_match = (
-            any(kw in yf_sector or kw in yf_industry for kw in sector_keywords)
-            or _sector_fuzzy_match(yf_sector, yf_industry, sectors)
-        )
-        if not sector_match:
+        passes, reason = _passes_quality_filters(info, cfg)
+        if not passes:
             continue
-
-        market_cap = info.get("market_cap") or 0
-        market_cap_cr = market_cap / 1e7  # Convert to Crores
-
-        pe = info.get("pe")
-        debt_eq = info.get("debt_equity")
-        eps = info.get("eps_ttm")
-        price = info.get("current_price")
-
-        if market_cap_cr < cfg["min_market_cap_cr"]:
-            continue
-        if pe is not None and (pe <= cfg["min_pe"] or pe > cfg["max_pe"]):
-            continue
-        if debt_eq is not None and debt_eq > cfg["max_debt_equity"] * 100:
-            continue
-        if eps is not None and eps <= 0:
-            continue
-        if not price or price <= 0:
-            continue
-
-        results.append({
-            "ticker": ticker,
-            "company_name": info.get("company_name", ""),
-            "sector": info.get("sector", ""),
-            "market_cap_cr": round(market_cap_cr, 2),
-            "pe": round(pe, 2) if pe else None,
-            "pb": round(info.get("pb") or 0, 2),
-            "roe": round((info.get("roe") or 0) * 100, 2),
-            "debt_equity": round((debt_eq or 0) / 100, 2),
-            "revenue_growth": round((info.get("revenue_growth") or 0) * 100, 2),
-            "eps_growth": round((info.get("earnings_growth") or 0) * 100, 2),
-            "current_price": round(price, 2),
-        })
+        results.append(_build_result(ticker, info))
 
     # Sort by market cap descending, take top N
-    results.sort(key=lambda x: x["market_cap_cr"], reverse=True)
-    results = results[:cfg["max_stocks_per_theme"]]
+    results.sort(key=lambda r: r.get("market_cap_cr") or 0, reverse=True)
+    results = results[:max_results]
 
-    # Save to DB
-    for r in results:
-        c.execute("""
-            INSERT INTO screened_stocks
-            (session_date, theme_id, ticker, company_name, sector, market_cap_cr,
-             pe, pb, roe, debt_equity, revenue_growth, eps_growth, current_price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (session_date, theme_id, ticker) DO NOTHING
-        """, (today, theme_id, r["ticker"], r["company_name"], r["sector"],
-              r["market_cap_cr"], r["pe"], r["pb"], r["roe"], r["debt_equity"],
-              r["revenue_growth"], r["eps_growth"], r["current_price"]))
+    # Persist to DB (theme_id = -1 = screen_nifty500 cache)
+    if results:
+        conn2 = get_conn()
+        c2    = conn2.cursor()
+        cols  = list(results[0].keys())
+        for r in results:
+            placeholders = ", ".join(["%s"] * (len(cols) + 2))
+            col_str      = ", ".join(["session_date", "theme_id"] + cols)
+            vals         = [today, cache_theme_id] + [r.get(c) for c in cols]
+            c2.execute(
+                f"INSERT INTO screened_stocks ({col_str}) VALUES ({placeholders}) "
+                f"ON CONFLICT DO NOTHING",
+                vals,
+            )
+        conn2.commit()
+        conn2.close()
 
-    conn.commit()
-    conn.close()
+    print(f"  screen_nifty500 done: {len(results)} stocks passed filters")
     return results
 
 
-def _sector_fuzzy_match(yf_sector: str, yf_industry: str, nse_sectors: list[str]) -> bool:
-    """Map yfinance sector names to NSE sector names loosely."""
-    mapping = {
-        "technology": ["INFORMATION TECHNOLOGY"],
-        "financial": ["FINANCIAL SERVICES"],
-        "healthcare": ["HEALTHCARE"],
-        "energy": ["OIL GAS & CONSUMABLE FUELS", "POWER"],
-        "industrials": ["CAPITAL GOODS", "CONSTRUCTION"],
-        "consumer": ["FAST MOVING CONSUMER GOODS", "CONSUMER DURABLES", "CONSUMER SERVICES"],
-        "materials": ["METALS & MINING", "CHEMICALS", "CONSTRUCTION MATERIALS"],
-        "real estate": ["REALTY"],
-        "utilities": ["POWER", "UTILITIES"],
-        "communication": ["TELECOMMUNICATION", "MEDIA ENTERTAINMENT & PUBLICATION"],
-        "automobile": ["AUTOMOBILE AND AUTO COMPONENTS"],
-        "pharma": ["HEALTHCARE"],
-        "banking": ["FINANCIAL SERVICES"],
-        "power": ["POWER"],
-        "defence": ["CAPITAL GOODS"],
-        "infrastructure": ["CONSTRUCTION", "CAPITAL GOODS"],
-        "renewable": ["POWER"],
-        "cement": ["CONSTRUCTION MATERIALS"],
-        "steel": ["METALS & MINING"],
-        "chemical": ["CHEMICALS"],
-        "textile": ["TEXTILES"],
-    }
-    nse_upper = [s.upper() for s in nse_sectors]
-    combined = (yf_sector + " " + yf_industry).lower()
-    for keyword, mapped_sectors in mapping.items():
-        if keyword in combined:
-            if any(ms in nse_upper for ms in mapped_sectors):
-                return True
-    return False
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy theme-based screener (kept for backward compatibility)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def screen_stocks_for_theme(
+    theme: dict,
+    sectors: list[str] | None = None,
+    filters: dict | None = None,
+    max_stocks: int | None = None,
+    force: bool = False,
+) -> list[dict]:
+    """
+    Screen Nifty 500 stocks for a given investment theme.
+
+    theme   : dict with keys 'id', 'name', 'description', 'sectors'
+    sectors : override theme sectors (optional)
+    filters : override SCREENER_DEFAULTS keys (optional)
+    max_stocks : final count cap (defaults to SCREENER_DEFAULTS["max_stocks_per_theme"])
+    """
+    today    = date.today().isoformat()
+    theme_id = theme.get("id", 0)
+    cfg      = {**SCREENER_DEFAULTS, **(filters or {})}
+    max_n    = max_stocks or cfg.get("max_stocks_per_theme", 15)
+
+    conn = get_conn()
+    c    = conn.cursor()
+
+    if force:
+        c.execute(
+            "DELETE FROM screened_stocks WHERE session_date = %s AND theme_id = %s",
+            (today, theme_id),
+        )
+        conn.commit()
+
+    cached = c.execute(
+        "SELECT * FROM screened_stocks WHERE session_date = %s AND theme_id = %s ORDER BY market_cap_cr DESC",
+        (today, theme_id),
+    ).fetchall()
+    if cached:
+        conn.close()
+        return [dict(r) for r in cached][:max_n]
+
+    conn.close()
+
+    effective_sectors = sectors or theme.get("sectors", [])
+
+    # Build universe from Nifty 500 with optional sector pre-filter
+    nifty500_df = load_nifty500_stocks()
+    if nifty500_df.empty:
+        nse_df  = load_nse_stocks()
+        tickers = nse_df["YF_TICKER"].dropna().tolist()
+    elif effective_sectors and "INDUSTRY" in nifty500_df.columns:
+        mask        = nifty500_df["INDUSTRY"].fillna("").apply(
+            lambda ind: _nifty500_industry_match(ind, effective_sectors)
+        )
+        filtered_df = nifty500_df[mask]
+        tickers     = filtered_df["YF_TICKER"].dropna().tolist() if not filtered_df.empty                       else nifty500_df["YF_TICKER"].dropna().tolist()
+    else:
+        tickers = nifty500_df["YF_TICKER"].dropna().tolist()
+
+    batch        = tickers[: max_n * 4]
+    fundamentals = get_fundamentals_batch(batch, pause=0.2)
+
+    results = []
+    for ticker, info in fundamentals.items():
+        if not info:
+            continue
+        passes, reason = _passes_quality_filters(info, cfg)
+        if not passes:
+            continue
+        results.append(_build_result(ticker, info))
+
+    results.sort(key=lambda r: r.get("market_cap_cr") or 0, reverse=True)
+    results = results[:max_n]
+
+    if results:
+        conn2 = get_conn()
+        c2    = conn2.cursor()
+        cols  = list(results[0].keys())
+        for r in results:
+            placeholders = ", ".join(["%s"] * (len(cols) + 2))
+            col_str      = ", ".join(["session_date", "theme_id"] + cols)
+            vals         = [today, theme_id] + [r.get(c) for c in cols]
+            c2.execute(
+                f"INSERT INTO screened_stocks ({col_str}) VALUES ({placeholders}) "
+                f"ON CONFLICT DO NOTHING",
+                vals,
+            )
+        conn2.commit()
+        conn2.close()
+
+    return results
